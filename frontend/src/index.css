@@ -8295,3 +8295,57 @@ button {
 @keyframes ai-planner-spin { to { transform: rotate(360deg); } }
 @media (max-width: 640px) { .ai-planner { padding: 16px; } .ai-planner-actions { width: 100%; } .ai-planner-actions .ai-planner-btn, .ai-plan-preview__actions .ai-planner-btn { flex: 1 1 100%; } }
 @media (prefers-reduced-motion: reduce) { .ai-planner-btn, .ai-planner-spinner { animation: none; transition: none; } .ai-planner-btn:hover:not(:disabled) { transform: none; } }
+/* BrainScribe login — preserve original spacing */
+html:has(.login-page),
+body:has(.login-page) {
+  margin: 0;
+  min-height: 100%;
+}
+
+body:has(.login-page) {
+  overflow: hidden;
+}
+
+body:has(.login-page) #root {
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+.login-page {
+  box-sizing: border-box;
+  min-height: 100vh;
+  min-height: 100dvh;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.login-page .auth-window {
+  width: min(100%, 1120px);
+  max-height: calc(100dvh - 48px);
+  margin: auto;
+}
+
+/* Keep the original form and panel spacing */
+.login-page .auth-panel {
+  min-width: 0;
+  min-height: 0;
+}
+
+.login-page .auth-form-wrap {
+  min-height: 0;
+}
+
+@media (max-width: 768px) {
+  .login-page {
+    padding: 16px;
+  }
+
+  .login-page .auth-window {
+    max-height: calc(100dvh - 32px);
+  }
+}

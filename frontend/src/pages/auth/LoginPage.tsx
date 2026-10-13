@@ -48,7 +48,7 @@ export default function LoginPage() {
   }
 
   return (
-    <main className="auth-shell">
+    <main className="auth-shell login-page">
       <div className="ambient ambient-one" />
       <div className="ambient ambient-two" />
       <div className="ambient ambient-three" />
