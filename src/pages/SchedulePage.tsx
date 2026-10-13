@@ -1,5 +1,11 @@
 
-import { useEffect, useMemo, useState, type CSSProperties, type FormEvent } from "react";
+import {
+  useEffect,
+  useMemo,
+  useState,
+  type CSSProperties,
+  type FormEvent,
+} from "react";
 import { useNavigate } from "react-router-dom";
 import {
   addDoc,
@@ -8,6 +14,7 @@ import {
   doc,
   onSnapshot,
   updateDoc,
+  writeBatch,
 } from "firebase/firestore";
 import { signOut } from "firebase/auth";
 import {
@@ -25,7 +32,6 @@ import {
   X,
   BookOpen,
   LayoutDashboard,
-  Library,
   Timer,
   ChartNoAxesCombined,
   FileText,
@@ -34,10 +40,16 @@ import {
   RefreshCw,
   AlertCircle,
   Flag,
+  Upload,
+  FileUp,
+  CalendarClock,
 } from "lucide-react";
-
+import * as pdfjsLib from "pdfjs-dist";
+import * as mammoth from "mammoth";
 import { db, auth } from "../config/firebase";
 import { useAuth } from "../contexts/AuthContext";
+import { httpsCallable } from "firebase/functions";
+import { functions } from "../config/functions";
 
 type Priority = "High" | "Medium" | "Low";
 type ViewMode = "day" | "week";
@@ -55,6 +67,34 @@ type StudySession = {
 };
 
 type SessionForm = Omit<StudySession, "id" | "completed">;
+
+type GeneratedStudySession = {
+  title: string;
+  subject: string;
+  date: string;
+  startTime: string;
+  duration: number;
+  priority: Priority;
+  notes: string;
+};
+
+type GenerateStudyPlanResponse = {
+  sessions: GeneratedStudySession[];
+  provider: "gemini" | "groq";
+  warning: string;
+};
+
+type GenerateStudyPlanRequest = {
+  mode: "weekly" | "daily" | "syllabus";
+  startDate: string;
+  deadline?: string;
+  syllabusText?: string;
+};
+
+const generateStudyPlanCallable = httpsCallable<
+  GenerateStudyPlanRequest,
+  GenerateStudyPlanResponse
+>(functions, "generateStudyPlan");
 
 const SUBJECTS = [
   "Data Structures",
@@ -81,6 +121,11 @@ const NAV_ITEMS = [
   { label: "Notes", path: "/notes", icon: FileText },
 ];
 
+pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
+  "pdfjs-dist/build/pdf.worker.min.mjs",
+  import.meta.url,
+).toString();
+
 function dateOffset(offset: number) {
   const date = new Date();
   date.setDate(date.getDate() + offset);
@@ -106,13 +151,15 @@ function getWeekStart(dateKey: string) {
   return date;
 }
 
-function formatDate(dateKey: string, options?: Intl.DateTimeFormatOptions) {
+function formatDate(
+  dateKey: string,
+  options?: Intl.DateTimeFormatOptions,
+) {
   if (!dateKey) return "";
-  return parseDate(dateKey).toLocaleDateString("en-US", options ?? {
-    month: "short",
-    day: "numeric",
-    year: "numeric",
-  });
+  return parseDate(dateKey).toLocaleDateString(
+    "en-US",
+    options ?? { month: "short", day: "numeric", year: "numeric" },
+  );
 }
 
 function formatTime(time: string) {
@@ -183,6 +230,75 @@ const inputStyle: CSSProperties = {
   outlineOffset: 2,
 };
 
+async function extractSyllabusText(file: File): Promise<string> {
+  const extension = file.name.split(".").pop()?.toLowerCase();
+
+  if (!file.size) {
+    throw new Error("The selected file is empty.");
+  }
+
+  if (file.size > 10 * 1024 * 1024) {
+    throw new Error("Please select a file smaller than 10 MB.");
+  }
+
+  let text = "";
+
+  if (extension === "txt") {
+    text = await file.text();
+  } else if (extension === "docx") {
+    const arrayBuffer = await file.arrayBuffer();
+    const result = await mammoth.extractRawText({ arrayBuffer });
+    text = result.value;
+  } else if (extension === "pdf") {
+    const arrayBuffer = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({
+      data: new Uint8Array(arrayBuffer),
+    }).promise;
+
+    const pages: string[] = [];
+
+    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
+      const page = await pdf.getPage(pageNumber);
+      const content = await page.getTextContent();
+
+      const pageText = content.items
+        .map((item) => ("str" in item ? item.str : ""))
+        .filter(Boolean)
+        .join(" ");
+
+      pages.push(pageText);
+    }
+
+    text = pages.join("\n\n");
+  } else {
+    throw new Error(
+      "Unsupported file type. Upload a PDF, DOCX, or TXT file.",
+    );
+  }
+
+  text = text.replace(/\s+/g, " ").trim();
+
+  if (!text) {
+    throw new Error(
+      "No readable text was found. Scanned PDFs require OCR.",
+    );
+  }
+
+  if (text.length > 60_000) {
+    throw new Error(
+      "The document contains too much text. Split the syllabus into smaller documents.",
+    );
+  }
+
+  if (text.length < 30) {
+    throw new Error(
+      "The document contains too little readable text to analyze.",
+    );
+  }
+
+  return text;
+}
+
 export default function SchedulePage() {
   const navigate = useNavigate();
   const { user } = useAuth();
@@ -192,22 +308,34 @@ export default function SchedulePage() {
   const [savingSession, setSavingSession] = useState(false);
   const [deletingSession, setDeletingSession] = useState(false);
   const [scheduleError, setScheduleError] = useState("");
-
   const [view, setView] = useState<ViewMode>("week");
   const [selectedDate, setSelectedDate] = useState(dateOffset(0));
   const [subjectFilter, setSubjectFilter] = useState("All subjects");
   const [searchQuery, setSearchQuery] = useState("");
-
   const [modalOpen, setModalOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState<SessionForm>(getInitialForm);
   const [formError, setFormError] = useState("");
-  const [sessionToDelete, setSessionToDelete] = useState<StudySession | null>(null);
+  const [sessionToDelete, setSessionToDelete] =
+    useState<StudySession | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
-  const firstName = user?.displayName?.trim().split(/\s+/)[0] || "Student";
+  const [generatingPlan, setGeneratingPlan] = useState(false);
+  const [savingPlan, setSavingPlan] = useState(false);
+  const [generatedPlan, setGeneratedPlan] =
+    useState<GeneratedStudySession[] | null>(null);
+  const [aiProvider, setAiProvider] =
+    useState<"gemini" | "groq" | null>(null);
+  const [aiError, setAiError] = useState("");
 
-  // Load this user's sessions and keep the page updated in real time.
+  const [syllabusFile, setSyllabusFile] = useState<File | null>(null);
+  const [syllabusDeadline, setSyllabusDeadline] = useState("");
+  const [syllabusError, setSyllabusError] = useState("");
+  const [syllabusWarning, setSyllabusWarning] = useState("");
+
+  const firstName =
+    user?.displayName?.trim().split(/\s+/)[0] || "Student";
+
   useEffect(() => {
     if (!user?.uid) {
       setSessions([]);
@@ -218,40 +346,52 @@ export default function SchedulePage() {
     setLoadingSessions(true);
     setScheduleError("");
 
-    const sessionsRef = collection(db, "users", user.uid, "studySessions");
+    const sessionsRef = collection(
+      db,
+      "users",
+      user.uid,
+      "studySessions",
+    );
 
     const unsubscribe = onSnapshot(
       sessionsRef,
       (snapshot) => {
-        const loadedSessions: StudySession[] = snapshot.docs.map((sessionDoc) => {
-          const data = sessionDoc.data();
-          const priority: Priority =
-            data.priority === "High" ||
-            data.priority === "Medium" ||
-            data.priority === "Low"
-              ? data.priority
-              : "Medium";
+        const loadedSessions: StudySession[] = snapshot.docs.map(
+          (sessionDoc) => {
+            const data = sessionDoc.data();
 
-          return {
-            id: sessionDoc.id,
-            title: typeof data.title === "string" ? data.title : "",
-            subject:
-              typeof data.subject === "string"
-                ? data.subject
-                : SUBJECTS[0],
-            date: typeof data.date === "string" ? data.date : "",
-            startTime:
-              typeof data.startTime === "string" ? data.startTime : "09:00",
-            duration:
-              typeof data.duration === "number" ? data.duration : 45,
-            priority,
-            completed: data.completed === true,
-            notes: typeof data.notes === "string" ? data.notes : "",
-          };
-        });
+            const priority: Priority =
+              data.priority === "High" ||
+              data.priority === "Medium" ||
+              data.priority === "Low"
+                ? data.priority
+                : "Medium";
+
+            return {
+              id: sessionDoc.id,
+              title: typeof data.title === "string" ? data.title : "",
+              subject:
+                typeof data.subject === "string"
+                  ? data.subject
+                  : SUBJECTS[0],
+              date: typeof data.date === "string" ? data.date : "",
+              startTime:
+                typeof data.startTime === "string"
+                  ? data.startTime
+                  : "09:00",
+              duration:
+                typeof data.duration === "number" ? data.duration : 45,
+              priority,
+              completed: data.completed === true,
+              notes: typeof data.notes === "string" ? data.notes : "",
+            };
+          },
+        );
 
         loadedSessions.sort((a, b) =>
-          `${a.date}T${a.startTime}`.localeCompare(`${b.date}T${b.startTime}`)
+          `${a.date}T${a.startTime}`.localeCompare(
+            `${b.date}T${b.startTime}`,
+          ),
         );
 
         setSessions(loadedSessions);
@@ -260,10 +400,10 @@ export default function SchedulePage() {
       (error) => {
         console.error("[Schedule] Failed to load sessions:", error);
         setScheduleError(
-          "Couldn't load your study sessions. Check your connection and Firestore rules."
+          "Couldn't load your study sessions. Check your connection and Firestore rules.",
         );
         setLoadingSessions(false);
-      }
+      },
     );
 
     return unsubscribe;
@@ -271,6 +411,7 @@ export default function SchedulePage() {
 
   const weekDates = useMemo(() => {
     const start = getWeekStart(selectedDate);
+
     return Array.from({ length: 7 }, (_, index) => {
       const date = new Date(start);
       date.setDate(start.getDate() + index);
@@ -278,37 +419,46 @@ export default function SchedulePage() {
     });
   }, [selectedDate]);
 
-  const visibleSessions = useMemo(() => {
-    return sessions
-      .filter((session) => {
-        const matchesDate =
-          view === "day"
-            ? session.date === selectedDate
-            : weekDates.includes(session.date);
+  const visibleSessions = useMemo(
+    () =>
+      sessions
+        .filter((session) => {
+          const matchesDate =
+            view === "day"
+              ? session.date === selectedDate
+              : weekDates.includes(session.date);
 
-        const matchesSubject =
-          subjectFilter === "All subjects" ||
-          session.subject === subjectFilter;
+          const matchesSubject =
+            subjectFilter === "All subjects" ||
+            session.subject === subjectFilter;
 
-        const query = searchQuery.trim().toLowerCase();
-        const matchesSearch =
-          !query ||
-          session.title.toLowerCase().includes(query) ||
-          session.subject.toLowerCase().includes(query) ||
-          session.notes.toLowerCase().includes(query);
+          const query = searchQuery.trim().toLowerCase();
 
-        return matchesDate && matchesSubject && matchesSearch;
-      })
-      .sort((a, b) =>
-        `${a.date}T${a.startTime}`.localeCompare(`${b.date}T${b.startTime}`)
-      );
-  }, [sessions, view, selectedDate, weekDates, subjectFilter, searchQuery]);
+          const matchesSearch =
+            !query ||
+            session.title.toLowerCase().includes(query) ||
+            session.subject.toLowerCase().includes(query) ||
+            session.notes.toLowerCase().includes(query);
 
-  const completedCount = visibleSessions.filter((session) => session.completed).length;
+          return matchesDate && matchesSubject && matchesSearch;
+        })
+        .sort((a, b) =>
+          `${a.date}T${a.startTime}`.localeCompare(
+            `${b.date}T${b.startTime}`,
+          ),
+        ),
+    [sessions, view, selectedDate, weekDates, subjectFilter, searchQuery],
+  );
+
+  const completedCount = visibleSessions.filter(
+    (session) => session.completed,
+  ).length;
+
   const totalMinutes = visibleSessions.reduce(
     (total, session) => total + session.duration,
-    0
+    0,
   );
+
   const completedMinutes = visibleSessions
     .filter((session) => session.completed)
     .reduce((total, session) => total + session.duration, 0);
@@ -341,9 +491,177 @@ export default function SchedulePage() {
     setModalOpen(true);
   }
 
+
+const handleGenerateStudyPlan = async (
+  mode: "weekly" | "daily",
+) => {
+  if (!auth.currentUser?.uid) {
+    setAiError("Please sign in again before generating a study plan.");
+    return;
+  }
+
+  setGeneratingPlan(true);
+  setAiError("");
+  setGeneratedPlan(null);
+  setAiProvider(null);
+  setSyllabusWarning("");
+
+  try {
+    const startDate =
+      mode === "weekly"
+        ? toDateKey(getWeekStart(selectedDate))
+        : dateOffset(0);
+
+    const result = await generateStudyPlanCallable({
+      mode,
+      startDate,
+    });
+
+    if (!result.data.sessions.length) {
+      setAiError(
+        "The AI did not generate any sessions. Please try again.",
+      );
+      return;
+    }
+
+    setGeneratedPlan(result.data.sessions);
+    setAiProvider(result.data.provider);
+    setSyllabusWarning(result.data.warning || "");
+  } catch (error: unknown) {
+    const message =
+      error instanceof Error
+        ? error.message
+        : "An unexpected error occurred.";
+
+    setAiError(
+      `Couldn't generate your study plan: ${message.replace(
+        /^FirebaseError:\s*/i,
+        "",
+      )}`,
+    );
+  } finally {
+    setGeneratingPlan(false);
+  }
+};
+
+
+
+const handleGenerateSyllabusPlan = async () => {
+  const uid = auth.currentUser?.uid;
+
+  if (!uid) {
+    setAiError("Please sign in again before generating a study plan.");
+    return;
+  }
+
+  if (!syllabusFile) {
+    setSyllabusError("Please upload your syllabus document first.");
+    return;
+  }
+
+  if (!syllabusDeadline) {
+    setSyllabusError("Please select your completion deadline.");
+    return;
+  }
+
+  if (syllabusDeadline < dateOffset(0)) {
+    setSyllabusError("The deadline cannot be in the past.");
+    return;
+  }
+
+  setGeneratingPlan(true);
+  setAiError("");
+  setSyllabusError("");
+  setSyllabusWarning("");
+  setGeneratedPlan(null);
+  setAiProvider(null);
+
+  try {
+    // Extract readable text from the uploaded PDF, DOCX, or TXT file.
+    const syllabusText = await extractSyllabusText(syllabusFile);
+
+    // Send the extracted text to the Firebase callable function.
+    const result = await generateStudyPlanCallable({
+      mode: "syllabus",
+      startDate: dateOffset(0),
+      deadline: syllabusDeadline,
+      syllabusText: syllabusText,
+    });
+
+    if (!result.data.sessions.length) {
+      setAiError(
+        "The AI did not generate any sessions. Try another syllabus document.",
+      );
+      return;
+    }
+
+    setGeneratedPlan(result.data.sessions);
+    setAiProvider(result.data.provider);
+    setSyllabusWarning(result.data.warning || "");
+  } catch (error: unknown) {
+    const message =
+      error instanceof Error
+        ? error.message
+        : "An unexpected error occurred.";
+
+    setAiError(
+      `Couldn't generate your syllabus plan: ${message.replace(
+        /^FirebaseError:\s*/i,
+        "",
+      )}`,
+    );
+  } finally {
+    setGeneratingPlan(false);
+  }
+};
+
+
+  const handleSaveGeneratedPlan = async () => {
+    const uid = auth.currentUser?.uid;
+
+    if (!uid || !generatedPlan?.length) return;
+
+    setSavingPlan(true);
+    setAiError("");
+
+    try {
+      const sessionsRef = collection(
+        db,
+        "users",
+        uid,
+        "studySessions",
+      );
+
+      const batch = writeBatch(db);
+
+      generatedPlan.forEach((session) => {
+        const sessionRef = doc(sessionsRef);
+
+        batch.set(sessionRef, {
+          ...session,
+          completed: false,
+        });
+      });
+
+      await batch.commit();
+
+      setGeneratedPlan(null);
+      setAiProvider(null);
+      setSyllabusWarning("");
+    } catch (error: unknown) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "An unexpected error occurred.";
+
+      setAiError(`Couldn't save the study plan: ${message}`);
+    } finally {
+      setSavingPlan(false);
+    }
+  };
+
   async function saveSession(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-
     if (!user?.uid || savingSession) return;
 
     setFormError("");
@@ -385,12 +703,12 @@ export default function SchedulePage() {
       if (editingId) {
         await updateDoc(
           doc(db, "users", user.uid, "studySessions", editingId),
-          sessionData
+          sessionData,
         );
       } else {
         await addDoc(
           collection(db, "users", user.uid, "studySessions"),
-          sessionData
+          sessionData,
         );
       }
 
@@ -418,7 +736,7 @@ export default function SchedulePage() {
     try {
       await updateDoc(
         doc(db, "users", user.uid, "studySessions", sessionId),
-        { completed: !session.completed }
+        { completed: !session.completed },
       );
     } catch (error) {
       console.error("[Schedule] Failed to update completion:", error);
@@ -434,8 +752,15 @@ export default function SchedulePage() {
 
     try {
       await deleteDoc(
-        doc(db, "users", user.uid, "studySessions", sessionToDelete.id)
+        doc(
+          db,
+          "users",
+          user.uid,
+          "studySessions",
+          sessionToDelete.id,
+        ),
       );
+
       setSessionToDelete(null);
     } catch (error) {
       console.error("[Schedule] Failed to delete session:", error);
@@ -463,7 +788,7 @@ export default function SchedulePage() {
         })
       : `${formatDate(weekDates[0], { month: "short", day: "numeric" })} – ${formatDate(
           weekDates[6],
-          { month: "short", day: "numeric", year: "numeric" }
+          { month: "short", day: "numeric", year: "numeric" },
         )}`;
 
   const fieldLabel: CSSProperties = {
@@ -484,7 +809,9 @@ export default function SchedulePage() {
         />
       )}
 
-      <aside className={`dashboard-sidebar ${sidebarOpen ? "sidebar-open" : ""}`}>
+      <aside
+        className={`dashboard-sidebar ${sidebarOpen ? "sidebar-open" : ""}`}
+      >
         <div className="dashboard-brand">
           <span
             style={{
@@ -510,6 +837,7 @@ export default function SchedulePage() {
         </div>
 
         <p className="sidebar-section-label">WORKSPACE</p>
+
         <nav className="sidebar-nav">
           {NAV_ITEMS.map(({ label, path, icon: Icon }) => (
             <button
@@ -523,7 +851,9 @@ export default function SchedulePage() {
             >
               <Icon size={19} />
               <span>{label}</span>
-              {path === "/schedule" && <span className="nav-active-indicator" />}
+              {path === "/schedule" && (
+                <span className="nav-active-indicator" />
+              )}
             </button>
           ))}
         </nav>
@@ -539,7 +869,9 @@ export default function SchedulePage() {
 
           <div className="sidebar-profile">
             <span className="profile-avatar">
-              {(user?.displayName || user?.email || "S").charAt(0).toUpperCase()}
+              {(user?.displayName || user?.email || "S")
+                .charAt(0)
+                .toUpperCase()}
             </span>
             <span className="profile-info">
               <strong>{firstName}</strong>
@@ -570,7 +902,13 @@ export default function SchedulePage() {
               <Menu size={21} />
             </button>
             <div>
-              <p style={{ color: "var(--muted)", fontSize: 13, margin: "0 0 4px" }}>
+              <p
+                style={{
+                  color: "var(--muted)",
+                  fontSize: 13,
+                  margin: "0 0 4px",
+                }}
+              >
                 Workspace / Planner
               </p>
               <h1 style={{ fontSize: 22, fontWeight: 750, margin: 0 }}>
@@ -604,6 +942,7 @@ export default function SchedulePage() {
               )}
               {loadingSessions ? "Syncing..." : "Firestore synced"}
             </span>
+
             <button
               type="button"
               style={primaryButtonStyle}
@@ -615,7 +954,15 @@ export default function SchedulePage() {
           </div>
         </header>
 
-        <div style={{ padding: "26px 28px 40px", maxWidth: 1250, margin: "0 auto", width: "100%", boxSizing: "border-box" }}>
+        <div
+          style={{
+            padding: "26px 28px 40px",
+            maxWidth: 1250,
+            margin: "0 auto",
+            width: "100%",
+            boxSizing: "border-box",
+          }}
+        >
           <section
             style={{
               ...cardStyle,
@@ -635,17 +982,44 @@ export default function SchedulePage() {
               }}
             >
               <div>
-                <p style={{ color: "#4F9CF9", fontWeight: 700, fontSize: 12, margin: "0 0 8px", letterSpacing: 1.1 }}>
+                <p
+                  style={{
+                    color: "#4F9CF9",
+                    fontWeight: 700,
+                    fontSize: 12,
+                    margin: "0 0 8px",
+                    letterSpacing: 1.1,
+                  }}
+                >
                   YOUR LEARNING PLAN
                 </p>
-                <h2 style={{ margin: "0 0 8px", fontSize: 25, fontWeight: 750 }}>
+                <h2
+                  style={{
+                    margin: "0 0 8px",
+                    fontSize: 25,
+                    fontWeight: 750,
+                  }}
+                >
                   Make time for what matters.
                 </h2>
-                <p style={{ margin: 0, color: "var(--muted)", lineHeight: 1.6, maxWidth: 560 }}>
-                  Organize your study sessions, track your progress, and keep your learning momentum going.
+                <p
+                  style={{
+                    margin: 0,
+                    color: "var(--muted)",
+                    lineHeight: 1.6,
+                    maxWidth: 560,
+                  }}
+                >
+                  Organize your study sessions, track your progress, and keep
+                  your learning momentum going.
                 </p>
               </div>
-              <button type="button" style={secondaryButtonStyle} onClick={shiftToToday}>
+
+              <button
+                type="button"
+                style={secondaryButtonStyle}
+                onClick={shiftToToday}
+              >
                 <CalendarDays size={17} />
                 Today
               </button>
@@ -660,10 +1034,22 @@ export default function SchedulePage() {
               }}
             >
               {[
-                { label: "Planned sessions", value: visibleSessions.length, icon: CalendarDays },
+                {
+                  label: "Planned sessions",
+                  value: visibleSessions.length,
+                  icon: CalendarDays,
+                },
                 { label: "Completed", value: completedCount, icon: Check },
-                { label: "Planned time", value: `${Math.floor(totalMinutes / 60)}h ${totalMinutes % 60}m`, icon: Clock3 },
-                { label: "Time completed", value: `${Math.floor(completedMinutes / 60)}h ${completedMinutes % 60}m`, icon: CalendarCheck },
+                {
+                  label: "Planned time",
+                  value: `${Math.floor(totalMinutes / 60)}h ${totalMinutes % 60}m`,
+                  icon: Clock3,
+                },
+                {
+                  label: "Time completed",
+                  value: `${Math.floor(completedMinutes / 60)}h ${completedMinutes % 60}m`,
+                  icon: CalendarCheck,
+                },
               ].map(({ label, value, icon: Icon }) => (
                 <div
                   key={label}
@@ -675,10 +1061,18 @@ export default function SchedulePage() {
                   }}
                 >
                   <Icon size={18} color="#4F9CF9" />
-                  <p style={{ margin: "12px 0 4px", color: "var(--muted)", fontSize: 12 }}>
+                  <p
+                    style={{
+                      margin: "12px 0 4px",
+                      color: "var(--muted)",
+                      fontSize: 12,
+                    }}
+                  >
                     {label}
                   </p>
-                  <strong style={{ fontSize: 22, fontWeight: 750 }}>{value}</strong>
+                  <strong style={{ fontSize: 22, fontWeight: 750 }}>
+                    {value}
+                  </strong>
                 </div>
               ))}
             </div>
@@ -712,34 +1106,29 @@ export default function SchedulePage() {
                 >
                   <ChevronRight size={18} />
                 </button>
-                <h3 style={{ fontSize: 16, margin: "0 0 0 4px" }}>{sectionTitle}</h3>
+                <h3 style={{ fontSize: 16, margin: "0 0 0 4px" }}>
+                  {sectionTitle}
+                </h3>
               </div>
 
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                <button
-                  type="button"
-                  style={{
-                    ...secondaryButtonStyle,
-                    background: view === "day" ? "#4F9CF9" : "var(--input-surface)",
-                    color: view === "day" ? "#fff" : "var(--text)",
-                    borderColor: view === "day" ? "#4F9CF9" : "var(--border)",
-                  }}
-                  onClick={() => setView("day")}
-                >
-                  Day
-                </button>
-                <button
-                  type="button"
-                  style={{
-                    ...secondaryButtonStyle,
-                    background: view === "week" ? "#4F9CF9" : "var(--input-surface)",
-                    color: view === "week" ? "#fff" : "var(--text)",
-                    borderColor: view === "week" ? "#4F9CF9" : "var(--border)",
-                  }}
-                  onClick={() => setView("week")}
-                >
-                  Week
-                </button>
+                {(["day", "week"] as const).map((mode) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    style={{
+                      ...secondaryButtonStyle,
+                      background:
+                        view === mode ? "#4F9CF9" : "var(--input-surface)",
+                      color: view === mode ? "#fff" : "var(--text)",
+                      borderColor:
+                        view === mode ? "#4F9CF9" : "var(--border)",
+                    }}
+                    onClick={() => setView(mode)}
+                  >
+                    {mode === "day" ? "Day" : "Week"}
+                  </button>
+                ))}
               </div>
             </div>
 
@@ -756,7 +1145,9 @@ export default function SchedulePage() {
                   const dateObject = parseDate(date);
                   const isSelected = date === selectedDate;
                   const isToday = date === dateOffset(0);
-                  const count = sessions.filter((session) => session.date === date).length;
+                  const count = sessions.filter(
+                    (session) => session.date === date,
+                  ).length;
 
                   return (
                     <button
@@ -771,15 +1162,32 @@ export default function SchedulePage() {
                         padding: "12px 3px",
                         borderRadius: 12,
                         border: `1px solid ${isSelected ? "#4F9CF9" : "var(--border)"}`,
-                        background: isSelected ? "color-mix(in srgb, #4F9CF9 14%, var(--surface))" : "var(--input-surface)",
+                        background: isSelected
+                          ? "color-mix(in srgb, #4F9CF9 14%, var(--surface))"
+                          : "var(--input-surface)",
                         color: "var(--text)",
                         cursor: "pointer",
                       }}
                     >
-                      <span style={{ display: "block", color: "var(--muted)", fontSize: 11, marginBottom: 8 }}>
-                        {dateObject.toLocaleDateString("en-US", { weekday: "short" })}
+                      <span
+                        style={{
+                          display: "block",
+                          color: "var(--muted)",
+                          fontSize: 11,
+                          marginBottom: 8,
+                        }}
+                      >
+                        {dateObject.toLocaleDateString("en-US", {
+                          weekday: "short",
+                        })}
                       </span>
-                      <strong style={{ display: "block", fontSize: 17, color: isSelected ? "#4F9CF9" : "var(--text)" }}>
+                      <strong
+                        style={{
+                          display: "block",
+                          fontSize: 17,
+                          color: isSelected ? "#4F9CF9" : "var(--text)",
+                        }}
+                      >
                         {dateObject.getDate()}
                       </strong>
                       <span
@@ -793,7 +1201,14 @@ export default function SchedulePage() {
                         }}
                       />
                       {isToday && (
-                        <span style={{ display: "block", fontSize: 9, color: "#4F9CF9", marginTop: 3 }}>
+                        <span
+                          style={{
+                            display: "block",
+                            fontSize: 9,
+                            color: "#4F9CF9",
+                            marginTop: 3,
+                          }}
+                        >
                           TODAY
                         </span>
                       )}
@@ -806,7 +1221,8 @@ export default function SchedulePage() {
             <div
               style={{
                 display: "grid",
-                gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 220px), 1fr))",
+                gridTemplateColumns:
+                  "repeat(auto-fit, minmax(min(100%, 220px), 1fr))",
                 gap: 12,
                 marginBottom: 20,
               }}
@@ -856,8 +1272,10 @@ export default function SchedulePage() {
                   gap: 9,
                   alignItems: "center",
                   color: "#F87171",
-                  background: "color-mix(in srgb, #EF4444 9%, var(--surface))",
-                  border: "1px solid color-mix(in srgb, #EF4444 30%, var(--border))",
+                  background:
+                    "color-mix(in srgb, #EF4444 9%, var(--surface))",
+                  border:
+                    "1px solid color-mix(in srgb, #EF4444 30%, var(--border))",
                   padding: 13,
                   borderRadius: 11,
                   marginBottom: 16,
@@ -869,13 +1287,427 @@ export default function SchedulePage() {
               </div>
             )}
 
+            <section className="ai-planner">
+              <div className="ai-planner__header">
+                <div>
+                  <p className="ai-planner__eyebrow">
+                    AI-POWERED PLANNING
+                  </p>
+                  <h3 className="ai-planner__title">
+                    Plan smarter with AI
+                  </h3>
+                  <p className="ai-planner__description">
+                    Generate daily or weekly plans, or upload your syllabus
+                    to build a deadline-based study schedule.
+                  </p>
+                </div>
+
+                <div className="ai-planner-actions">
+                  <button
+                    type="button"
+                    className="ai-planner-btn ai-planner-btn--primary"
+                    onClick={() => void handleGenerateStudyPlan("weekly")}
+                    disabled={generatingPlan || savingPlan}
+                  >
+                    {generatingPlan ? (
+                      <>
+                        <RefreshCw
+                          size={16}
+                          className="ai-planner-spinner"
+                        />
+                        Generating...
+                      </>
+                    ) : (
+                      <>
+                        <CalendarDays size={16} />
+                        Generate weekly plan
+                      </>
+                    )}
+                  </button>
+
+                  <button
+                    type="button"
+                    className="ai-planner-btn"
+                    onClick={() => void handleGenerateStudyPlan("daily")}
+                    disabled={generatingPlan || savingPlan}
+                  >
+                    <Clock3 size={16} />
+                    Generate today's plan
+                  </button>
+                </div>
+              </div>
+
+              <div
+                style={{
+                  marginTop: 20,
+                  padding: 20,
+                  borderRadius: 16,
+                  border: "1px solid var(--border)",
+                  background:
+                    "linear-gradient(135deg, color-mix(in srgb, #4F9CF9 7%, var(--surface)), var(--surface))",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    gap: 12,
+                    alignItems: "flex-start",
+                  }}
+                >
+                  <span
+                    style={{
+                      display: "grid",
+                      placeItems: "center",
+                      width: 44,
+                      height: 44,
+                      flexShrink: 0,
+                      borderRadius: 13,
+                      background:
+                        "color-mix(in srgb, #4F9CF9 15%, var(--surface))",
+                      color: "#4F9CF9",
+                    }}
+                  >
+                    <FileUp size={22} />
+                  </span>
+                  <div>
+                    <h4
+                      style={{
+                        margin: "2px 0 6px",
+                        fontSize: 16,
+                      }}
+                    >
+                      Build a plan from your syllabus
+                    </h4>
+                    <p
+                      style={{
+                        margin: 0,
+                        color: "var(--muted)",
+                        fontSize: 13,
+                        lineHeight: 1.6,
+                      }}
+                    >
+                      Upload one document containing one or multiple
+                      subjects. AI will analyze its topics and distribute
+                      study sessions before your deadline.
+                    </p>
+                  </div>
+                </div>
+
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns:
+                      "repeat(auto-fit, minmax(min(100%, 220px), 1fr))",
+                    gap: 16,
+                    marginTop: 20,
+                  }}
+                >
+                  <label style={{ minWidth: 0 }}>
+                    <span style={fieldLabel}>Syllabus document</span>
+                    <input
+                      type="file"
+                      accept=".pdf,.docx,.txt,application/pdf,text/plain,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                      disabled={generatingPlan || savingPlan}
+                      onChange={(event) => {
+                        const file = event.target.files?.[0] ?? null;
+                        setSyllabusFile(file);
+                        setSyllabusError("");
+                        setAiError("");
+                        setSyllabusWarning("");
+                        setGeneratedPlan(null);
+                        setAiProvider(null);
+                      }}
+                      style={{
+                        ...inputStyle,
+                        padding: 9,
+                        fontSize: 12,
+                      }}
+                    />
+                    {syllabusFile && (
+                      <span
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 6,
+                          marginTop: 8,
+                          color: "#4F9CF9",
+                          fontSize: 12,
+                          overflowWrap: "anywhere",
+                        }}
+                      >
+                        <FileText size={15} />
+                        {syllabusFile.name}
+                      </span>
+                    )}
+                    <span
+                      style={{
+                        display: "block",
+                        color: "var(--muted)",
+                        fontSize: 11,
+                        marginTop: 6,
+                      }}
+                    >
+                      PDF, DOCX or TXT · Maximum 10 MB
+                    </span>
+                  </label>
+
+                  <label>
+                    <span style={fieldLabel}>
+                      Finish the syllabus by
+                    </span>
+                    <span
+                      style={{
+                        position: "relative",
+                        display: "block",
+                      }}
+                    >
+                      <CalendarClock
+                        size={17}
+                        style={{
+                          position: "absolute",
+                          left: 12,
+                          top: "50%",
+                          transform: "translateY(-50%)",
+                          color: "var(--muted)",
+                          pointerEvents: "none",
+                        }}
+                      />
+                      <input
+                        type="date"
+                        value={syllabusDeadline}
+                        min={dateOffset(0)}
+                        disabled={generatingPlan || savingPlan}
+                        onChange={(event) => {
+                          setSyllabusDeadline(event.target.value);
+                          setSyllabusError("");
+                          setAiError("");
+                          setSyllabusWarning("");
+                          setGeneratedPlan(null);
+                          setAiProvider(null);
+                        }}
+                        style={{
+                          ...inputStyle,
+                          paddingLeft: 39,
+                        }}
+                      />
+                    </span>
+                    <span
+                      style={{
+                        display: "block",
+                        color: "var(--muted)",
+                        fontSize: 11,
+                        marginTop: 6,
+                      }}
+                    >
+                      Choose your target completion date.
+                    </span>
+                  </label>
+                </div>
+
+                {syllabusError && (
+                  <div
+                    role="alert"
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      color: "#F87171",
+                      fontSize: 13,
+                      marginTop: 14,
+                    }}
+                  >
+                    <AlertCircle size={16} />
+                    {syllabusError}
+                  </div>
+                )}
+
+                <button
+                  type="button"
+                  className="ai-planner-btn ai-planner-btn--primary"
+                  onClick={() => void handleGenerateSyllabusPlan()}
+                  disabled={generatingPlan || savingPlan}
+                  style={{ marginTop: 18 }}
+                >
+                  {generatingPlan ? (
+                    <>
+                      <RefreshCw
+                        size={16}
+                        className="ai-planner-spinner"
+                      />
+                      Analyzing syllabus and building plan...
+                    </>
+                  ) : (
+                    <>
+                      <Upload size={16} />
+                      Analyze syllabus and generate plan
+                    </>
+                  )}
+                </button>
+              </div>
+
+              {aiError && (
+                <div className="ai-planner-error" role="alert">
+                  <AlertCircle size={17} />
+                  <span>{aiError}</span>
+                </div>
+              )}
+
+              {generatedPlan && (
+                <div className="ai-plan-preview">
+                  <div className="ai-plan-preview__header">
+                    <div>
+                      <h4>Review your study plan</h4>
+                      <p>
+                        Generated with{" "}
+                        {aiProvider === "groq"
+                          ? "Groq fallback"
+                          : "Gemini"}
+                        . Nothing is saved until you approve it.
+                      </p>
+
+                      {syllabusWarning && (
+                        <div
+                          role="status"
+                          style={{
+                            display: "flex",
+                            alignItems: "flex-start",
+                            gap: 9,
+                            marginTop: 12,
+                            padding: 12,
+                            borderRadius: 10,
+                            background:
+                              "color-mix(in srgb, #F59E0B 10%, var(--surface))",
+                            border:
+                              "1px solid color-mix(in srgb, #F59E0B 30%, var(--border))",
+                            color: "var(--text)",
+                            fontSize: 13,
+                            lineHeight: 1.6,
+                          }}
+                        >
+                          <AlertCircle
+                            size={17}
+                            color="#F59E0B"
+                            style={{ flexShrink: 0 }}
+                          />
+                          <span>{syllabusWarning}</span>
+                        </div>
+                      )}
+                    </div>
+
+                    <span className="ai-plan-count">
+                      {generatedPlan.length} sessions
+                    </span>
+                  </div>
+
+                  <div className="ai-plan-list">
+                    {generatedPlan.map((session, index) => (
+                      <article
+                        className="ai-plan-session"
+                        key={`${session.date}-${session.startTime}-${session.subject}-${index}`}
+                      >
+                        <div className="ai-plan-session__top">
+                          <div>
+                            <h5>{session.title}</h5>
+                            <span className="ai-plan-session__subject">
+                              {session.subject}
+                            </span>
+                          </div>
+                          <span
+                            className={`ai-plan-priority ai-plan-priority--${session.priority.toLowerCase()}`}
+                          >
+                            {session.priority}
+                          </span>
+                        </div>
+
+                        <div className="ai-plan-session__meta">
+                          <span>
+                            <CalendarDays size={14} />
+                            {formatDate(session.date, {
+                              month: "short",
+                              day: "numeric",
+                              year: "numeric",
+                            })}
+                          </span>
+                          <span>
+                            <Clock3 size={14} />
+                            {formatTime(session.startTime)}
+                          </span>
+                          <span>{session.duration} min</span>
+                        </div>
+
+                        {session.notes && (
+                          <p className="ai-plan-session__notes">
+                            {session.notes}
+                          </p>
+                        )}
+                      </article>
+                    ))}
+                  </div>
+
+                  <div className="ai-plan-preview__actions">
+                    <button
+                      type="button"
+                      className="ai-planner-btn ai-planner-btn--primary"
+                      onClick={() => void handleSaveGeneratedPlan()}
+                      disabled={savingPlan || generatingPlan}
+                    >
+                      {savingPlan ? (
+                        <>
+                          <RefreshCw
+                            size={16}
+                            className="ai-planner-spinner"
+                          />
+                          Saving plan...
+                        </>
+                      ) : (
+                        <>
+                          <Check size={16} />
+                          Approve and save plan
+                        </>
+                      )}
+                    </button>
+
+                    <button
+                      type="button"
+                      className="ai-planner-btn ai-planner-btn--secondary"
+                      onClick={() => {
+                        setGeneratedPlan(null);
+                        setAiProvider(null);
+                        setAiError("");
+                        setSyllabusWarning("");
+                      }}
+                      disabled={savingPlan}
+                    >
+                      <X size={16} />
+                      Discard
+                    </button>
+                  </div>
+                </div>
+              )}
+            </section>
+
             {loadingSessions ? (
-              <div style={{ textAlign: "center", padding: "54px 15px", color: "var(--muted)" }} role="status">
+              <div
+                style={{
+                  textAlign: "center",
+                  padding: "54px 15px",
+                  color: "var(--muted)",
+                }}
+                role="status"
+              >
                 <RefreshCw size={25} style={{ marginBottom: 10 }} />
-                <h3 style={{ color: "var(--text)", margin: "0 0 7px", fontSize: 16 }}>
+                <h3
+                  style={{
+                    color: "var(--text)",
+                    margin: "0 0 7px",
+                    fontSize: 16,
+                  }}
+                >
                   Loading your study schedule
                 </h3>
-                <p style={{ margin: 0, fontSize: 13 }}>Syncing your sessions with your account.</p>
+                <p style={{ margin: 0, fontSize: 13 }}>
+                  Syncing your sessions with your account.
+                </p>
               </div>
             ) : visibleSessions.length ? (
               <div style={{ display: "grid", gap: 12 }}>
@@ -898,25 +1730,40 @@ export default function SchedulePage() {
                         width: 4,
                         flexShrink: 0,
                         borderRadius: 8,
-                        background: SUBJECT_COLORS[session.subject] || "#4F9CF9",
+                        background:
+                          SUBJECT_COLORS[session.subject] || "#4F9CF9",
                       }}
                     />
 
                     <button
                       type="button"
-                      title={session.completed ? "Mark as incomplete" : "Mark as completed"}
-                      aria-label={session.completed ? "Mark as incomplete" : "Mark as completed"}
-                      onClick={() => toggleComplete(session.id)}
+                      title={
+                        session.completed
+                          ? "Mark as incomplete"
+                          : "Mark as completed"
+                      }
+                      aria-label={
+                        session.completed
+                          ? "Mark as incomplete"
+                          : "Mark as completed"
+                      }
+                      onClick={() => void toggleComplete(session.id)}
                       style={{
                         border: "none",
                         background: "transparent",
-                        color: session.completed ? "#34D399" : "var(--muted)",
+                        color: session.completed
+                          ? "#34D399"
+                          : "var(--muted)",
                         cursor: "pointer",
                         alignSelf: "flex-start",
                         padding: 2,
                       }}
                     >
-                      {session.completed ? <Check size={21} /> : <Circle size={21} />}
+                      {session.completed ? (
+                        <Check size={21} />
+                      ) : (
+                        <Circle size={21} />
+                      )}
                     </button>
 
                     <div style={{ flex: 1, minWidth: 0 }}>
@@ -936,7 +1783,9 @@ export default function SchedulePage() {
                               margin: "0 0 7px",
                               fontWeight: 700,
                               color: "var(--text)",
-                              textDecoration: session.completed ? "line-through" : "none",
+                              textDecoration: session.completed
+                                ? "line-through"
+                                : "none",
                               overflowWrap: "anywhere",
                             }}
                           >
@@ -945,7 +1794,8 @@ export default function SchedulePage() {
                           <span
                             style={{
                               display: "inline-block",
-                              color: SUBJECT_COLORS[session.subject] || "#4F9CF9",
+                              color:
+                                SUBJECT_COLORS[session.subject] || "#4F9CF9",
                               fontSize: 12,
                               fontWeight: 650,
                               marginBottom: 9,
@@ -955,34 +1805,32 @@ export default function SchedulePage() {
                           </span>
                         </div>
 
-                        <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
-                          <span
-                            style={{
-                              display: "inline-flex",
-                              alignItems: "center",
-                              gap: 5,
-                              borderRadius: 7,
-                              padding: "5px 8px",
-                              fontSize: 11,
-                              fontWeight: 650,
-                              color:
-                                session.priority === "High"
-                                  ? "#F87171"
-                                  : session.priority === "Medium"
-                                    ? "#FBBF24"
-                                    : "#34D399",
-                              background:
-                                session.priority === "High"
-                                  ? "color-mix(in srgb, #EF4444 12%, var(--surface))"
-                                  : session.priority === "Medium"
-                                    ? "color-mix(in srgb, #F59E0B 12%, var(--surface))"
-                                    : "color-mix(in srgb, #10B981 12%, var(--surface))",
-                            }}
-                          >
-                            <Flag size={12} />
-                            {session.priority}
-                          </span>
-                        </div>
+                        <span
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: 5,
+                            borderRadius: 7,
+                            padding: "5px 8px",
+                            fontSize: 11,
+                            fontWeight: 650,
+                            color:
+                              session.priority === "High"
+                                ? "#F87171"
+                                : session.priority === "Medium"
+                                  ? "#FBBF24"
+                                  : "#34D399",
+                            background:
+                              session.priority === "High"
+                                ? "color-mix(in srgb, #EF4444 12%, var(--surface))"
+                                : session.priority === "Medium"
+                                  ? "color-mix(in srgb, #F59E0B 12%, var(--surface))"
+                                  : "color-mix(in srgb, #10B981 12%, var(--surface))",
+                          }}
+                        >
+                          <Flag size={12} />
+                          {session.priority}
+                        </span>
                       </div>
 
                       <div
@@ -995,30 +1843,65 @@ export default function SchedulePage() {
                           fontSize: 12,
                         }}
                       >
-                        <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+                        <span
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: 5,
+                          }}
+                        >
                           <Clock3 size={14} />
                           {formatTime(session.startTime)} · {session.duration} min
                         </span>
-                        <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+                        <span
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: 5,
+                          }}
+                        >
                           <CalendarDays size={14} />
-                          {formatDate(session.date, { month: "short", day: "numeric" })}
+                          {formatDate(session.date, {
+                            month: "short",
+                            day: "numeric",
+                          })}
                         </span>
                       </div>
 
                       {session.notes && (
-                        <p style={{ color: "var(--muted)", fontSize: 13, lineHeight: 1.5, margin: "10px 0 0", whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+                        <p
+                          style={{
+                            color: "var(--muted)",
+                            fontSize: 13,
+                            lineHeight: 1.5,
+                            margin: "10px 0 0",
+                            whiteSpace: "pre-wrap",
+                            overflowWrap: "anywhere",
+                          }}
+                        >
                           {session.notes}
                         </p>
                       )}
                     </div>
 
-                    <div style={{ display: "flex", gap: 5, alignSelf: "flex-start" }}>
+                    <div
+                      style={{
+                        display: "flex",
+                        gap: 5,
+                        alignSelf: "flex-start",
+                      }}
+                    >
                       <button
                         type="button"
                         title="Edit session"
                         aria-label="Edit session"
                         onClick={() => openEditModal(session)}
-                        style={{ ...secondaryButtonStyle, padding: 8, border: "none", background: "transparent" }}
+                        style={{
+                          ...secondaryButtonStyle,
+                          padding: 8,
+                          border: "none",
+                          background: "transparent",
+                        }}
                       >
                         <Pencil size={16} />
                       </button>
@@ -1027,7 +1910,13 @@ export default function SchedulePage() {
                         title="Delete session"
                         aria-label="Delete session"
                         onClick={() => setSessionToDelete(session)}
-                        style={{ ...secondaryButtonStyle, padding: 8, border: "none", background: "transparent", color: "#F87171" }}
+                        style={{
+                          ...secondaryButtonStyle,
+                          padding: 8,
+                          border: "none",
+                          background: "transparent",
+                          color: "#F87171",
+                        }}
                       >
                         <Trash2 size={16} />
                       </button>
@@ -1045,19 +1934,34 @@ export default function SchedulePage() {
                     placeItems: "center",
                     margin: "0 auto 16px",
                     borderRadius: 18,
-                    background: "color-mix(in srgb, #4F9CF9 12%, var(--surface))",
+                    background:
+                      "color-mix(in srgb, #4F9CF9 12%, var(--surface))",
                     color: "#4F9CF9",
                   }}
                 >
                   <CalendarDays size={27} />
                 </span>
-                <h3 style={{ fontSize: 17, margin: "0 0 8px" }}>Nothing scheduled here yet</h3>
-                <p style={{ color: "var(--muted)", fontSize: 13, margin: "0 auto 18px", maxWidth: 360, lineHeight: 1.6 }}>
+                <h3 style={{ fontSize: 17, margin: "0 0 8px" }}>
+                  Nothing scheduled here yet
+                </h3>
+                <p
+                  style={{
+                    color: "var(--muted)",
+                    fontSize: 13,
+                    margin: "0 auto 18px",
+                    maxWidth: 360,
+                    lineHeight: 1.6,
+                  }}
+                >
                   {searchQuery || subjectFilter !== "All subjects"
                     ? "No sessions match your current search or filters. Try adjusting them."
                     : "Add a study session to plan your next learning milestone."}
                 </p>
-                <button type="button" style={primaryButtonStyle} onClick={() => openAddModal(selectedDate)}>
+                <button
+                  type="button"
+                  style={primaryButtonStyle}
+                  onClick={() => openAddModal(selectedDate)}
+                >
                   <Plus size={17} />
                   Add a study session
                 </button>
@@ -1071,7 +1975,10 @@ export default function SchedulePage() {
         <div
           role="presentation"
           onMouseDown={(event) => {
-            if (event.target === event.currentTarget && !savingSession) {
+            if (
+              event.target === event.currentTarget &&
+              !savingSession
+            ) {
               setModalOpen(false);
             }
           }}
@@ -1105,13 +2012,32 @@ export default function SchedulePage() {
               boxShadow: "0 25px 90px rgba(0,0,0,.3)",
             }}
           >
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, marginBottom: 22 }}>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "flex-start",
+                gap: 12,
+                marginBottom: 22,
+              }}
+            >
               <div>
-                <h2 id="session-modal-title" style={{ margin: "0 0 7px", fontSize: 21 }}>
+                <h2
+                  id="session-modal-title"
+                  style={{ margin: "0 0 7px", fontSize: 21 }}
+                >
                   {editingId ? "Edit study session" : "Plan a study session"}
                 </h2>
-                <p style={{ color: "var(--muted)", fontSize: 13, margin: 0 }}>
-                  {editingId ? "Update the details of your session." : "Add a session to your personal study schedule."}
+                <p
+                  style={{
+                    color: "var(--muted)",
+                    fontSize: 13,
+                    margin: 0,
+                  }}
+                >
+                  {editingId
+                    ? "Update the details of your session."
+                    : "Add a session to your personal study schedule."}
                 </p>
               </div>
               <button
@@ -1125,13 +2051,18 @@ export default function SchedulePage() {
               </button>
             </div>
 
-            <form onSubmit={saveSession} style={{ display: "grid", gap: 16 }}>
+            <form
+              onSubmit={saveSession}
+              style={{ display: "grid", gap: 16 }}
+            >
               <label>
                 <span style={fieldLabel}>Session title *</span>
                 <input
                   autoFocus
                   value={form.title}
-                  onChange={(event) => setForm({ ...form, title: event.target.value })}
+                  onChange={(event) =>
+                    setForm({ ...form, title: event.target.value })
+                  }
                   placeholder="e.g. Revise linked lists"
                   maxLength={120}
                   required
@@ -1143,7 +2074,9 @@ export default function SchedulePage() {
                 <span style={fieldLabel}>Subject *</span>
                 <select
                   value={form.subject}
-                  onChange={(event) => setForm({ ...form, subject: event.target.value })}
+                  onChange={(event) =>
+                    setForm({ ...form, subject: event.target.value })
+                  }
                   style={inputStyle}
                 >
                   {SUBJECTS.map((subject) => (
@@ -1152,31 +2085,48 @@ export default function SchedulePage() {
                 </select>
               </label>
 
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 12 }}>
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns:
+                    "repeat(auto-fit, minmax(160px, 1fr))",
+                  gap: 12,
+                }}
+              >
                 <label>
                   <span style={fieldLabel}>Date *</span>
                   <input
                     type="date"
                     value={form.date}
-                    onChange={(event) => setForm({ ...form, date: event.target.value })}
+                    onChange={(event) =>
+                      setForm({ ...form, date: event.target.value })
+                    }
                     required
                     style={inputStyle}
                   />
                 </label>
-
                 <label>
                   <span style={fieldLabel}>Start time *</span>
                   <input
                     type="time"
                     value={form.startTime}
-                    onChange={(event) => setForm({ ...form, startTime: event.target.value })}
+                    onChange={(event) =>
+                      setForm({ ...form, startTime: event.target.value })
+                    }
                     required
                     style={inputStyle}
                   />
                 </label>
               </div>
 
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 12 }}>
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns:
+                    "repeat(auto-fit, minmax(160px, 1fr))",
+                  gap: 12,
+                }}
+              >
                 <label>
                   <span style={fieldLabel}>Duration (minutes) *</span>
                   <input
@@ -1185,17 +2135,26 @@ export default function SchedulePage() {
                     max={480}
                     step={5}
                     value={form.duration}
-                    onChange={(event) => setForm({ ...form, duration: Number(event.target.value) })}
+                    onChange={(event) =>
+                      setForm({
+                        ...form,
+                        duration: Number(event.target.value),
+                      })
+                    }
                     required
                     style={inputStyle}
                   />
                 </label>
-
                 <label>
                   <span style={fieldLabel}>Priority</span>
                   <select
                     value={form.priority}
-                    onChange={(event) => setForm({ ...form, priority: event.target.value as Priority })}
+                    onChange={(event) =>
+                      setForm({
+                        ...form,
+                        priority: event.target.value as Priority,
+                      })
+                    }
                     style={inputStyle}
                   >
                     <option value="High">High</option>
@@ -1209,21 +2168,41 @@ export default function SchedulePage() {
                 <span style={fieldLabel}>Notes (optional)</span>
                 <textarea
                   value={form.notes}
-                  onChange={(event) => setForm({ ...form, notes: event.target.value })}
+                  onChange={(event) =>
+                    setForm({ ...form, notes: event.target.value })
+                  }
                   placeholder="Topics to cover, tasks, or reminders..."
                   rows={3}
                   maxLength={2000}
-                  style={{ ...inputStyle, resize: "vertical", minHeight: 90 }}
+                  style={{
+                    ...inputStyle,
+                    resize: "vertical",
+                    minHeight: 90,
+                  }}
                 />
               </label>
 
               {formError && (
-                <p role="alert" style={{ color: "#F87171", fontSize: 13, margin: 0 }}>
+                <p
+                  role="alert"
+                  style={{
+                    color: "#F87171",
+                    fontSize: 13,
+                    margin: 0,
+                  }}
+                >
                   {formError}
                 </p>
               )}
 
-              <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 4 }}>
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "flex-end",
+                  gap: 10,
+                  marginTop: 4,
+                }}
+              >
                 <button
                   type="button"
                   disabled={savingSession}
@@ -1235,7 +2214,10 @@ export default function SchedulePage() {
                 <button
                   type="submit"
                   disabled={savingSession}
-                  style={{ ...primaryButtonStyle, opacity: savingSession ? 0.7 : 1 }}
+                  style={{
+                    ...primaryButtonStyle,
+                    opacity: savingSession ? 0.7 : 1,
+                  }}
                 >
                   {savingSession ? (
                     <>
@@ -1259,7 +2241,10 @@ export default function SchedulePage() {
         <div
           role="presentation"
           onMouseDown={(event) => {
-            if (event.target === event.currentTarget && !deletingSession) {
+            if (
+              event.target === event.currentTarget &&
+              !deletingSession
+            ) {
               setSessionToDelete(null);
             }
           }}
@@ -1296,20 +2281,40 @@ export default function SchedulePage() {
                 width: 46,
                 height: 46,
                 borderRadius: 14,
-                background: "color-mix(in srgb, #EF4444 13%, var(--surface))",
+                background:
+                  "color-mix(in srgb, #EF4444 13%, var(--surface))",
                 color: "#F87171",
                 marginBottom: 16,
               }}
             >
               <Trash2 size={22} />
             </span>
-            <h2 id="delete-session-title" style={{ fontSize: 19, margin: "0 0 9px" }}>
+
+            <h2
+              id="delete-session-title"
+              style={{ fontSize: 19, margin: "0 0 9px" }}
+            >
               Delete this session?
             </h2>
-            <p style={{ color: "var(--muted)", fontSize: 13, lineHeight: 1.6, margin: "0 0 22px" }}>
-              “{sessionToDelete.title}” will be permanently removed from your schedule.
+            <p
+              style={{
+                color: "var(--muted)",
+                fontSize: 13,
+                lineHeight: 1.6,
+                margin: "0 0 22px",
+              }}
+            >
+              “{sessionToDelete.title}” will be permanently removed from
+              your schedule.
             </p>
-            <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "flex-end",
+                gap: 10,
+              }}
+            >
               <button
                 type="button"
                 disabled={deletingSession}
@@ -1321,8 +2326,12 @@ export default function SchedulePage() {
               <button
                 type="button"
                 disabled={deletingSession}
-                style={{ ...primaryButtonStyle, background: "#DC4444", opacity: deletingSession ? 0.7 : 1 }}
-                onClick={confirmDelete}
+                style={{
+                  ...primaryButtonStyle,
+                  background: "#DC4444",
+                  opacity: deletingSession ? 0.7 : 1,
+                }}
+                onClick={() => void confirmDelete()}
               >
                 {deletingSession ? "Deleting..." : "Delete session"}
               </button>

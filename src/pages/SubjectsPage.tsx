@@ -1,5 +1,11 @@
 
-import { useMemo, useState, type FormEvent, type CSSProperties } from "react";
+import {
+  useEffect,
+  useMemo,
+  useState,
+  type FormEvent,
+  type CSSProperties,
+} from "react";
 import { useNavigate } from "react-router-dom";
 import {
   BrainCircuit,
@@ -24,6 +30,15 @@ import {
   Target,
   BookMarked,
 } from "lucide-react";
+import {
+  addDoc,
+  collection,
+  deleteDoc,
+  doc,
+  onSnapshot,
+  updateDoc,
+} from "firebase/firestore";
+import { db } from "../config/firebase";
 import { useAuth } from "../contexts/AuthContext";
 import { logoutUser } from "../services/authService";
 import { useTheme } from "../contexts/ThemeContext";
@@ -38,35 +53,14 @@ type Subject = {
   completedTopics: number;
 };
 
-const initialSubjects: Subject[] = [
-  {
-    id: "subject-1",
-    name: "Data Structures",
-    description: "Core concepts, algorithms and problem-solving.",
-    color: "#4f9cf9",
-    targetDate: "",
-    totalTopics: 12,
-    completedTopics: 8,
-  },
-  {
-    id: "subject-2",
-    name: "Database Systems",
-    description: "SQL, normalization, transactions and indexing.",
-    color: "#a394ff",
-    targetDate: "",
-    totalTopics: 10,
-    completedTopics: 6,
-  },
-  {
-    id: "subject-3",
-    name: "Computer Networks",
-    description: "Networking fundamentals and protocols.",
-    color: "#50d6b1",
-    targetDate: "",
-    totalTopics: 9,
-    completedTopics: 4,
-  },
-];
+type SubjectForm = {
+  name: string;
+  description: string;
+  color: string;
+  targetDate: string;
+  totalTopics: string;
+  completedTopics: string;
+};
 
 const colorOptions = [
   { label: "Electric blue", value: "#4f9cf9" },
@@ -85,15 +79,6 @@ const navigation = [
   { label: "Notes & Resources", icon: NotebookPen, path: "/notes" },
 ];
 
-type SubjectForm = {
-  name: string;
-  description: string;
-  color: string;
-  targetDate: string;
-  totalTopics: string;
-  completedTopics: string;
-};
-
 const emptyForm: SubjectForm = {
   name: "",
   description: "",
@@ -108,7 +93,10 @@ export default function SubjectsPage() {
   const { theme, toggleTheme } = useTheme();
   const navigate = useNavigate();
 
-  const [subjects, setSubjects] = useState<Subject[]>(initialSubjects);
+  const [subjects, setSubjects] = useState<Subject[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [pageError, setPageError] = useState("");
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("all");
   const [modalOpen, setModalOpen] = useState(false);
@@ -118,6 +106,63 @@ export default function SubjectsPage() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [subjectToDelete, setSubjectToDelete] = useState<Subject | null>(null);
 
+  const uid = user?.uid;
+
+  // Keep the page synchronized with the signed-in user's Firestore subjects.
+  useEffect(() => {
+    if (!uid) {
+      setSubjects([]);
+      setLoading(false);
+      return;
+    }
+
+    setLoading(true);
+    setPageError("");
+
+    const subjectsRef = collection(db, "users", uid, "subjects");
+
+    const unsubscribe = onSnapshot(
+      subjectsRef,
+      (snapshot) => {
+        const firestoreSubjects: Subject[] = snapshot.docs.map(
+          (subjectDoc) => {
+            const data = subjectDoc.data();
+
+            return {
+              id: subjectDoc.id,
+              name: typeof data.name === "string" ? data.name : "",
+              description:
+                typeof data.description === "string" ? data.description : "",
+              color:
+                typeof data.color === "string" ? data.color : "#4f9cf9",
+              targetDate:
+                typeof data.targetDate === "string" ? data.targetDate : "",
+              totalTopics:
+                typeof data.totalTopics === "number" ? data.totalTopics : 10,
+              completedTopics:
+                typeof data.completedTopics === "number"
+                  ? data.completedTopics
+                  : 0,
+            };
+          },
+        );
+
+        setSubjects(firestoreSubjects);
+        setLoading(false);
+        setPageError("");
+      },
+      (error) => {
+        console.error("Failed to load subjects:", error);
+        setPageError(
+          "Unable to load your subjects. Check your Firestore security rules and connection.",
+        );
+        setLoading(false);
+      },
+    );
+
+    return unsubscribe;
+  }, [uid]);
+
   const firstName =
     user?.displayName?.trim().split(/\s+/)[0] ||
     user?.email?.split("@")[0] ||
@@ -125,9 +170,11 @@ export default function SubjectsPage() {
 
   const filteredSubjects = useMemo(() => {
     return subjects.filter((subject) => {
+      const query = search.toLowerCase();
+
       const matchesSearch =
-        subject.name.toLowerCase().includes(search.toLowerCase()) ||
-        subject.description.toLowerCase().includes(search.toLowerCase());
+        subject.name.toLowerCase().includes(query) ||
+        subject.description.toLowerCase().includes(query);
 
       const progress =
         subject.totalTopics > 0
@@ -136,9 +183,7 @@ export default function SubjectsPage() {
 
       const matchesFilter =
         filter === "all" ||
-        (filter === "in-progress" &&
-          progress > 0 &&
-          progress < 100) ||
+        (filter === "in-progress" && progress > 0 && progress < 100) ||
         (filter === "not-started" && progress === 0) ||
         (filter === "completed" && progress >= 100);
 
@@ -180,9 +225,15 @@ export default function SubjectsPage() {
     setModalOpen(true);
   }
 
-  function handleSubmit(event: FormEvent<HTMLFormElement>) {
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setFormError("");
+    setPageError("");
+
+    if (!uid) {
+      setFormError("Please sign in before managing your subjects.");
+      return;
+    }
 
     const name = form.name.trim();
     const total = Number(form.totalTopics);
@@ -196,6 +247,7 @@ export default function SubjectsPage() {
     if (
       !Number.isInteger(total) ||
       total < 1 ||
+      total > 500 ||
       !Number.isInteger(completed) ||
       completed < 0 ||
       completed > total
@@ -217,43 +269,62 @@ export default function SubjectsPage() {
       return;
     }
 
-    const subjectData: Subject = {
-      id: editingId ?? `subject-${Date.now()}`,
+    const subjectData = {
       name,
       description: form.description.trim(),
       color: form.color,
       targetDate: form.targetDate,
       totalTopics: total,
       completedTopics: completed,
+      updatedAt: new Date().toISOString(),
     };
 
-    if (editingId) {
-      setSubjects((current) =>
-        current.map((subject) =>
-          subject.id === editingId ? subjectData : subject,
-        ),
-      );
-    } else {
-      setSubjects((current) => [subjectData, ...current]);
+    setSaving(true);
+
+    try {
+      const subjectsRef = collection(db, "users", uid, "subjects");
+
+      if (editingId) {
+        await updateDoc(doc(subjectsRef, editingId), subjectData);
+      } else {
+        await addDoc(subjectsRef, {
+          ...subjectData,
+          createdAt: new Date().toISOString(),
+        });
+      }
+
+      setModalOpen(false);
+      setEditingId(null);
+      setForm(emptyForm);
+      setFormError("");
+    } catch (error) {
+      console.error("Failed to save subject:", error);
+      setFormError("Couldn't save this subject. Please try again.");
+    } finally {
+      setSaving(false);
     }
-
-    setModalOpen(false);
-    setEditingId(null);
-    setForm(emptyForm);
   }
-function requestDelete(subject: Subject) {
-  setSubjectToDelete(subject);
-}
 
-function confirmDelete() {
-  if (!subjectToDelete) return;
+  function requestDelete(subject: Subject) {
+    setSubjectToDelete(subject);
+  }
 
-  setSubjects((current) =>
-    current.filter((subject) => subject.id !== subjectToDelete.id),
-  );
+  async function confirmDelete() {
+    if (!subjectToDelete || !uid) return;
 
-  setSubjectToDelete(null);
-}
+    setPageError("");
+
+    try {
+      await deleteDoc(
+        doc(db, "users", uid, "subjects", subjectToDelete.id),
+      );
+      setSubjectToDelete(null);
+    } catch (error) {
+      console.error("Failed to delete subject:", error);
+      setPageError("Couldn't delete this subject. Please try again.");
+      setSubjectToDelete(null);
+    }
+  }
 
   async function handleLogout() {
     try {
@@ -398,7 +469,9 @@ function confirmDelete() {
                 <span className="welcome-live-dot" />
                 BUILD YOUR KNOWLEDGE
               </span>
-              <h1>Your learning library<span className="wave">✳</span></h1>
+              <h1>
+                Your learning library<span className="wave">✳</span>
+              </h1>
               <p>
                 Organize your subjects, track topic progress, and keep your
                 learning goals in sight.
@@ -412,6 +485,12 @@ function confirmDelete() {
             </button>
           </section>
 
+          {pageError && (
+            <div className="subject-form-error" role="alert">
+              {pageError}
+            </div>
+          )}
+
           <section className="subjects-overview-grid">
             <article className="dashboard-stat-card">
               <div className="stat-card-top">
@@ -420,61 +499,11 @@ function confirmDelete() {
                 </span>
                 <span className="stat-label">TOTAL SUBJECTS</span>
               </div>
-              <div className="stat-value">{String(subjects.length).padStart(2, "0")}</div>
+              <div className="stat-value">
+                {String(subjects.length).padStart(2, "0")}
+              </div>
               <p className="stat-caption">Subjects in this workspace</p>
             </article>
-
-{subjectToDelete && (
-  <div
-    className="subject-modal-backdrop"
-    onMouseDown={(event) => {
-      if (event.target === event.currentTarget) {
-        setSubjectToDelete(null);
-      }
-    }}
-  >
-    <section
-      className="subject-modal delete-confirm-modal"
-      role="alertdialog"
-      aria-modal="true"
-      aria-labelledby="delete-subject-title"
-      aria-describedby="delete-subject-description"
-    >
-      <div className="delete-warning-icon">
-        <Trash2 size={24} />
-      </div>
-
-      <span className="card-eyebrow">CONFIRM ACTION</span>
-
-      <h2 id="delete-subject-title">Delete this subject?</h2>
-
-      <p id="delete-subject-description">
-        You're about to remove{" "}
-        <strong>{subjectToDelete.name}</strong> from your workspace.
-        This action cannot be undone in this demo.
-      </p>
-
-      <div className="delete-confirm-actions">
-        <button
-          type="button"
-          className="secondary-subject-button"
-          onClick={() => setSubjectToDelete(null)}
-        >
-          Keep subject
-        </button>
-
-        <button
-          type="button"
-          className="delete-confirm-button"
-          onClick={confirmDelete}
-        >
-          <Trash2 size={16} />
-          Delete subject
-        </button>
-      </div>
-    </section>
-  </div>
-)}
 
             <article className="dashboard-stat-card">
               <div className="stat-card-top">
@@ -483,7 +512,10 @@ function confirmDelete() {
                 </span>
                 <span className="stat-label">TOPICS TRACKED</span>
               </div>
-              <div className="stat-value">{completedTopics}<span>/{totalTopics}</span></div>
+              <div className="stat-value">
+                {completedTopics}
+                <span>/{totalTopics}</span>
+              </div>
               <p className="stat-caption">Topics marked as completed</p>
             </article>
 
@@ -494,7 +526,10 @@ function confirmDelete() {
                 </span>
                 <span className="stat-label">OVERALL PROGRESS</span>
               </div>
-              <div className="stat-value">{overallProgress}<span>%</span></div>
+              <div className="stat-value">
+                {overallProgress}
+                <span>%</span>
+              </div>
               <p className="stat-caption">Across all listed topics</p>
               <div className="stat-bottom-line">
                 <span style={{ width: `${overallProgress}%` }} />
@@ -542,14 +577,25 @@ function confirmDelete() {
             <div>
               <h3>Your subjects</h3>
               <p>
-                {filteredSubjects.length}{" "}
-                {filteredSubjects.length === 1 ? "subject" : "subjects"} found
+                {loading
+                  ? "Loading your subjects..."
+                  : `${filteredSubjects.length} ${
+                      filteredSubjects.length === 1 ? "subject" : "subjects"
+                    } found`}
               </p>
             </div>
-            <span className="chart-badge">DEMO DATA</span>
+            <span className="chart-badge">FIREBASE SYNC</span>
           </section>
 
-          {filteredSubjects.length > 0 ? (
+          {loading ? (
+            <section className="dashboard-card subjects-empty-state">
+              <span className="empty-state-icon">
+                <BookOpen size={25} />
+              </span>
+              <h3>Loading your library</h3>
+              <p>Fetching your subjects from your account.</p>
+            </section>
+          ) : filteredSubjects.length > 0 ? (
             <section className="subjects-card-grid">
               {filteredSubjects.map((subject) => {
                 const progress =
@@ -563,7 +609,9 @@ function confirmDelete() {
                   <article
                     className="dashboard-card subject-detail-card"
                     key={subject.id}
-                    style={{ "--subject-accent": subject.color } as React.CSSProperties}
+                    style={
+                      { "--subject-accent": subject.color } as CSSProperties
+                    }
                   >
                     <div className="subject-card-accent" />
 
@@ -644,7 +692,11 @@ function confirmDelete() {
               <span className="empty-state-icon">
                 <BookOpen size={25} />
               </span>
-              <h3>No subjects found</h3>
+              <h3>
+                {search || filter !== "all"
+                  ? "No matching subjects"
+                  : "Your learning library is empty"}
+              </h3>
               <p>
                 {search || filter !== "all"
                   ? "Try changing your search or filter."
@@ -672,17 +724,70 @@ function confirmDelete() {
           )}
 
           <footer className="dashboard-footer">
-            <span>BrainScribe <span>·</span> Think smarter. Study better.</span>
-            <span>One focused step at a time <span className="footer-spark">✳</span></span>
+            <span>
+              BrainScribe <span>·</span> Think smarter. Study better.
+            </span>
+            <span>
+              One focused step at a time{" "}
+              <span className="footer-spark">✳</span>
+            </span>
           </footer>
         </div>
       </section>
+
+      {subjectToDelete && (
+        <div
+          className="subject-modal-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              setSubjectToDelete(null);
+            }
+          }}
+        >
+          <section
+            className="subject-modal delete-confirm-modal"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="delete-subject-title"
+            aria-describedby="delete-subject-description"
+          >
+            <div className="delete-warning-icon">
+              <Trash2 size={24} />
+            </div>
+            <span className="card-eyebrow">CONFIRM ACTION</span>
+            <h2 id="delete-subject-title">Delete this subject?</h2>
+            <p id="delete-subject-description">
+              You're about to remove <strong>{subjectToDelete.name}</strong>{" "}
+              from your workspace. This action cannot be undone.
+            </p>
+            <div className="delete-confirm-actions">
+              <button
+                type="button"
+                className="secondary-subject-button"
+                onClick={() => setSubjectToDelete(null)}
+              >
+                Keep subject
+              </button>
+              <button
+                type="button"
+                className="delete-confirm-button"
+                onClick={confirmDelete}
+              >
+                <Trash2 size={16} />
+                Delete subject
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
 
       {modalOpen && (
         <div
           className="subject-modal-backdrop"
           onMouseDown={(event) => {
-            if (event.target === event.currentTarget) setModalOpen(false);
+            if (event.target === event.currentTarget && !saving) {
+              setModalOpen(false);
+            }
           }}
         >
           <section
@@ -705,6 +810,7 @@ function confirmDelete() {
                 type="button"
                 className="subject-modal-close"
                 aria-label="Close dialog"
+                disabled={saving}
                 onClick={() => setModalOpen(false)}
               >
                 <X size={19} />
@@ -793,7 +899,7 @@ function confirmDelete() {
                       className={`subject-color-option ${
                         form.color === option.value ? "selected" : ""
                       }`}
-                      style={{ "--swatch": option.value } as React.CSSProperties}
+                      style={{ "--swatch": option.value } as CSSProperties}
                       onClick={() => setForm({ ...form, color: option.value })}
                       aria-label={option.label}
                       aria-pressed={form.color === option.value}
@@ -817,19 +923,28 @@ function confirmDelete() {
                 <button
                   type="button"
                   className="secondary-subject-button"
+                  disabled={saving}
                   onClick={() => setModalOpen(false)}
                 >
                   Cancel
                 </button>
-                <button type="submit" className="primary-dashboard-button">
-                  {editingId ? "Save changes" : "Create subject"}
-                  <ArrowUpRight size={17} />
+                <button
+                  type="submit"
+                  className="primary-dashboard-button"
+                  disabled={saving}
+                >
+                  {saving
+                    ? "Saving..."
+                    : editingId
+                      ? "Save changes"
+                      : "Create subject"}
+                  {!saving && <ArrowUpRight size={17} />}
                 </button>
               </div>
 
               <p className="subject-demo-note">
-                Demo mode: changes are stored in page state and will reset on
-                refresh until Firebase is connected.
+                Your subjects are saved to your Firebase account and sync
+                automatically.
               </p>
             </form>
           </section>
