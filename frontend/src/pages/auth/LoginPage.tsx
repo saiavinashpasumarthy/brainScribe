@@ -1,7 +1,7 @@
 import { useState, type FormEvent } from "react";
 import { FirebaseError } from "firebase/app";
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { loginUser } from "../../services/authService";
+import { loginUser, loginWithGoogle } from "../../services/authService";
 import ThemeToggle from "../../components/common/ThemeToggle";
 
 export default function LoginPage() {
@@ -19,7 +19,7 @@ export default function LoginPage() {
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
-
+const [googleLoading, setGoogleLoading] = useState(false);
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError("");
@@ -46,7 +46,41 @@ export default function LoginPage() {
       setLoading(false);
     }
   }
+async function handleGoogleLogin() {
+  setError("");
+  setGoogleLoading(true);
 
+  try {
+    await loginWithGoogle();
+    navigate(destination, { replace: true });
+  } catch (err) {
+    if (err instanceof FirebaseError) {
+      const messages: Record<string, string> = {
+        "auth/popup-closed-by-user":
+          "Google sign-in was cancelled. Please try again.",
+        "auth/popup-blocked":
+          "Your browser blocked the sign-in popup. Allow popups and try again.",
+        "auth/cancelled-popup-request":
+          "A sign-in request is already in progress.",
+        "auth/account-exists-with-different-credential":
+          "An account already exists with this email. Sign in using your original method.",
+        "auth/unauthorized-domain":
+          "This domain isn't authorized for Google sign-in in Firebase.",
+        "auth/network-request-failed":
+          "Network error. Check your connection.",
+      };
+
+      setError(
+        messages[err.code] ??
+          "Google sign-in failed. Please try again.",
+      );
+    } else {
+      setError("Something went wrong during Google sign-in.");
+    }
+  } finally {
+    setGoogleLoading(false);
+  }
+}
   return (
     <main className="auth-shell login-page">
       <div className="ambient ambient-one" />
@@ -188,6 +222,36 @@ export default function LoginPage() {
                 {loading && <span className="button-spinner" />}
               </button>
             </form>
+
+<div className="auth-divider">
+  <span>OR CONTINUE WITH GOOGLE</span>
+</div>
+
+
+<button
+  className="google-submit"
+  type="button"
+  onClick={handleGoogleLogin}
+  disabled={loading || googleLoading}
+>
+  <svg
+    className="google-icon"
+    viewBox="0 0 48 48"
+    aria-hidden="true"
+  >
+    <path fill="#4285F4" d="M43.6 24.5c0-1.4-.1-2.8-.4-4.1H24v7.8h11a9.4 9.4 0 0 1-4.1 6.2l6.4 5C41.1 35.8 43.6 30.7 43.6 24.5Z" />
+    <path fill="#34A853" d="M24 44c5.5 0 10.1-1.8 13.4-4.8l-6.4-5c-1.8 1.2-4.1 1.9-7 1.9-5.4 0-10-3.6-11.6-8.5l-6.6 5.1C9.1 39.4 16 44 24 44Z" />
+    <path fill="#FBBC05" d="M12.4 27.6a12 12 0 0 1 0-7.2l-6.6-5.1a20 20 0 0 0 0 17.4l6.6-5.1Z" />
+    <path fill="#EA4335" d="M24 12.4c3 0 5.7 1 7.8 3.1l5.8-5.8C34.1 6.5 29.5 4 24 4 16 4 9.1 8.6 5.8 15.3l6.6 5.1c1.6-4.9 6.2-8 11.6-8Z" />
+  </svg>
+
+  <span>
+    {googleLoading ? "Connecting to Google..." : "Continue with Google"}
+  </span>
+
+  {googleLoading && <span className="button-spinner" />}
+</button>
+
 
             <div className="auth-divider"><span>YOUR JOURNEY, CONTINUED</span></div>
 

@@ -29,6 +29,7 @@ import {
   ChevronRight,
   Target,
   BookMarked,
+  UploadCloud
 } from "lucide-react";
 import {
   addDoc,
@@ -37,11 +38,13 @@ import {
   doc,
   onSnapshot,
   updateDoc,
+  writeBatch,
 } from "firebase/firestore";
 import { db } from "../config/firebase";
 import { useAuth } from "../contexts/AuthContext";
 import { logoutUser } from "../services/authService";
 import { useTheme } from "../contexts/ThemeContext";
+import SyllabusImportModal from "../components/SyllabusImportModal";
 
 type Subject = {
   id: string;
@@ -70,14 +73,17 @@ const colorOptions = [
   { label: "Rose", value: "#ff8297" },
 ];
 
+
 const navigation = [
   { label: "Overview", icon: LayoutDashboard, path: "/dashboard" },
   { label: "My Subjects", icon: BookOpen, path: "/subjects" },
+  { label: "Exams", icon: CalendarDays, path: "/exams" },
   { label: "Study Schedule", icon: CalendarDays, path: "/schedule" },
   { label: "Focus Sessions", icon: Clock3, path: "/focus" },
   { label: "Analytics", icon: ChartNoAxesCombined, path: "/analytics" },
   { label: "Notes & Resources", icon: NotebookPen, path: "/notes" },
 ];
+
 
 const emptyForm: SubjectForm = {
   name: "",
@@ -105,6 +111,7 @@ export default function SubjectsPage() {
   const [formError, setFormError] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [subjectToDelete, setSubjectToDelete] = useState<Subject | null>(null);
+const [syllabusModalOpen, setSyllabusModalOpen] = useState(false);  
 
   const uid = user?.uid;
 
@@ -334,7 +341,53 @@ export default function SubjectsPage() {
       console.error("Logout failed:", error);
     }
   }
+async function handleImportSubjects(names: string[]) {
+  if (!uid) {
+    throw new Error("Please sign in before importing subjects.");
+  }
 
+  const existingNames = new Set(
+    subjects.map((subject) => subject.name.trim().toLowerCase()),
+  );
+
+  const uniqueNames: string[] = [];
+
+  for (const rawName of names) {
+    const name = rawName.trim();
+    const normalized = name.toLowerCase();
+
+    if (!name || existingNames.has(normalized)) continue;
+
+    existingNames.add(normalized);
+    uniqueNames.push(name);
+  }
+
+  if (!uniqueNames.length) {
+    throw new Error("All extracted subjects already exist in your library.");
+  }
+
+  const batch = writeBatch(db);
+  const subjectsRef = collection(db, "users", uid, "subjects");
+  const now = new Date().toISOString();
+
+  uniqueNames.forEach((name, index) => {
+    const newSubjectRef = doc(subjectsRef);
+
+    batch.set(newSubjectRef, {
+      name,
+      description: `Imported from syllabus`,
+      color: colorOptions[index % colorOptions.length].value,
+      targetDate: "",
+      totalTopics: 10,
+      completedTopics: 0,
+      source: "syllabus",
+      createdAt: now,
+      updatedAt: now,
+    });
+  });
+
+  await batch.commit();
+}
   return (
     <main className="dashboard-shell">
       <div className="dashboard-ambient dashboard-ambient-one" />
@@ -477,12 +530,23 @@ export default function SubjectsPage() {
                 learning goals in sight.
               </p>
             </div>
-            <button
-              className="primary-dashboard-button"
-              onClick={openAddModal}
-            >
-              <Plus size={18} /> Add subject
-            </button>
+<div className="subjects-welcome-actions">
+  <button
+    className="secondary-subject-button"
+    onClick={() => setSyllabusModalOpen(true)}
+  >
+    <UploadCloud size={18} />
+    Upload syllabi
+  </button>
+
+  <button
+    className="primary-dashboard-button"
+    onClick={openAddModal}
+  >
+    <Plus size={18} />
+    Add manually
+  </button>
+</div>
           </section>
 
           {pageError && (
@@ -950,6 +1014,13 @@ export default function SubjectsPage() {
           </section>
         </div>
       )}
+      {syllabusModalOpen && (
+  <SyllabusImportModal
+    existingNames={subjects.map((subject) => subject.name)}
+    onClose={() => setSyllabusModalOpen(false)}
+    onImport={handleImportSubjects}
+  />
+)}
     </main>
   );
 }

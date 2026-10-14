@@ -1,5 +1,14 @@
-import { useEffect, useMemo, useState } from "react";
+
+import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import { useNavigate } from "react-router-dom";
+import {
+  addDoc,
+  collection,
+  onSnapshot,
+  orderBy,
+  query,
+  serverTimestamp,
+} from "firebase/firestore";
 import {
   BrainCircuit,
   LayoutDashboard,
@@ -27,6 +36,7 @@ import {
 import { useAuth } from "../contexts/AuthContext";
 import { logoutUser } from "../services/authService";
 import { useTheme } from "../contexts/ThemeContext";
+import { db } from "../config/firebase";
 
 type FocusMode = "focus" | "shortBreak" | "longBreak";
 
@@ -110,19 +120,24 @@ export default function FocusPage() {
   const [customMinutes, setCustomMinutes] = useState("25");
 
   const [sessions, setSessions] = useState<FocusSession[]>([]);
-  const [totalFocusMinutes, setTotalFocusMinutes] = useState(0);
+  const [sessionSaveError, setSessionSaveError] = useState(false);
 
   const firstName = useMemo(() => {
     const name = user?.displayName?.trim();
+
     return name
       ? name.split(/\s+/)[0]
       : user?.email?.split("@")[0] || "Student";
   }, [user]);
 
   const totalSeconds = durationMinutes * 60;
+
   const progress =
     totalSeconds > 0
-      ? ((totalSeconds - remainingSeconds) / totalSeconds) * 100
+      ? Math.min(
+          100,
+          Math.max(0, ((totalSeconds - remainingSeconds) / totalSeconds) * 100),
+        )
       : 0;
 
   const completedToday = useMemo(() => {
@@ -133,6 +148,55 @@ export default function FocusPage() {
     ).length;
   }, [sessions]);
 
+  const totalFocusMinutes = useMemo(
+    () => sessions.reduce((total, session) => total + session.duration, 0),
+    [sessions],
+  );
+
+  // Load the signed-in user's focus sessions from Firestore.
+  useEffect(() => {
+    if (!user?.uid) {
+      setSessions([]);
+      return;
+    }
+
+    const sessionsQuery = query(
+      collection(db, "users", user.uid, "focusSessions"),
+      orderBy("completedAt", "desc"),
+    );
+
+    const unsubscribe = onSnapshot(
+      sessionsQuery,
+      (snapshot) => {
+        const loadedSessions: FocusSession[] = snapshot.docs.map((document) => {
+          const data = document.data();
+          const timestamp = data.completedAt;
+
+          return {
+            id: document.id,
+            subject:
+              typeof data.subject === "string"
+                ? data.subject
+                : "General Study",
+            duration: Number(data.duration) || 0,
+            completedAt:
+              timestamp && typeof timestamp.toDate === "function"
+                ? timestamp.toDate().toISOString()
+                : new Date().toISOString(),
+          };
+        });
+
+        setSessions(loadedSessions);
+      },
+      (error) => {
+        console.error("Failed to load focus sessions:", error);
+      },
+    );
+
+    return unsubscribe;
+  }, [user?.uid]);
+
+  // Run the countdown while the timer is active.
   useEffect(() => {
     if (!running) return;
 
@@ -143,28 +207,59 @@ export default function FocusPage() {
     return () => window.clearInterval(timer);
   }, [running]);
 
+  // Save a completed focus session to Firestore.
   useEffect(() => {
     if (!running || remainingSeconds !== 0) return;
 
     setRunning(false);
 
-    if (mode === "focus") {
-      const completedSession: FocusSession = {
-        id: `${Date.now()}-${Math.random()}`,
-        subject: selectedSubject,
-        duration: durationMinutes,
-        completedAt: new Date().toISOString(),
-      };
+    if (mode !== "focus") return;
 
-      setSessions((current) => [completedSession, ...current]);
-      setTotalFocusMinutes((current) => current + durationMinutes);
+    if (!user?.uid) {
+      setSessionSaveError(true);
+      return;
     }
+
+    let cancelled = false;
+const userId = user?.uid;
+
+if (!userId) {
+  setSessionSaveError(true);
+  return;
+}
+    async function saveCompletedSession() {
+      setSessionSaveError(false);
+
+      try {
+        await addDoc(
+          collection(db, "users", userId, "focusSessions"),
+          {
+            subject: selectedSubject,
+            duration: durationMinutes,
+            completedAt: serverTimestamp(),
+          },
+        );
+      } catch (error) {
+        console.error("Failed to save completed focus session:", error);
+
+        if (!cancelled) {
+          setSessionSaveError(true);
+        }
+      }
+    }
+
+    void saveCompletedSession();
+
+    return () => {
+      cancelled = true;
+    };
   }, [
     running,
     remainingSeconds,
     mode,
     selectedSubject,
     durationMinutes,
+    user?.uid,
   ]);
 
   function selectMode(nextMode: FocusMode) {
@@ -173,6 +268,7 @@ export default function FocusPage() {
     setDurationMinutes(modes[nextMode].minutes);
     setRemainingSeconds(modes[nextMode].minutes * 60);
     setCustomMinutes(String(modes[nextMode].minutes));
+    setSessionSaveError(false);
   }
 
   function applyCustomDuration() {
@@ -186,14 +282,18 @@ export default function FocusPage() {
     setMode("focus");
     setDurationMinutes(minutes);
     setRemainingSeconds(minutes * 60);
+    setSessionSaveError(false);
   }
 
   function resetTimer() {
     setRunning(false);
     setRemainingSeconds(durationMinutes * 60);
+    setSessionSaveError(false);
   }
 
   async function handleLogout() {
+    if (loggingOut) return;
+
     setLoggingOut(true);
 
     try {
@@ -212,6 +312,7 @@ export default function FocusPage() {
 
       {sidebarOpen && (
         <button
+          type="button"
           className="sidebar-backdrop"
           aria-label="Close navigation"
           onClick={() => setSidebarOpen(false)}
@@ -227,11 +328,13 @@ export default function FocusPage() {
           <span className="dashboard-brand-icon">
             <BrainCircuit size={23} />
           </span>
+
           <span>
             Brain<span>Scribe</span>
           </span>
 
           <button
+            type="button"
             className="sidebar-close"
             aria-label="Close navigation"
             onClick={() => setSidebarOpen(false)}
@@ -245,10 +348,12 @@ export default function FocusPage() {
         <nav className="sidebar-nav" aria-label="Main navigation">
           {navigation.map(({ label, icon: Icon, route }) => (
             <button
+              type="button"
               key={label}
               className={`sidebar-link ${
                 route === "/focus" ? "active" : ""
               }`}
+              aria-current={route === "/focus" ? "page" : undefined}
               onClick={() => {
                 setSidebarOpen(false);
                 navigate(route);
@@ -256,6 +361,7 @@ export default function FocusPage() {
             >
               <Icon size={19} strokeWidth={1.8} />
               <span>{label}</span>
+
               {route === "/focus" && (
                 <span className="nav-active-indicator" />
               )}
@@ -268,13 +374,19 @@ export default function FocusPage() {
             <span className="sidebar-tip-icon">
               <BrainCircuit size={18} />
             </span>
+
             <p>Protect your focus. Your future self will thank you.</p>
+
             <span className="tip-decoration">✳</span>
           </div>
 
           <button
+            type="button"
             className="sidebar-link"
-            onClick={() => navigate("/settings")}
+            onClick={() => {
+              setSidebarOpen(false);
+              navigate("/settings");
+            }}
           >
             <Settings size={19} strokeWidth={1.8} />
             <span>Settings</span>
@@ -291,6 +403,7 @@ export default function FocusPage() {
             </div>
 
             <button
+              type="button"
               className="logout-button"
               onClick={handleLogout}
               disabled={loggingOut}
@@ -307,9 +420,11 @@ export default function FocusPage() {
         <header className="dashboard-topbar">
           <div className="topbar-left">
             <button
+              type="button"
               className="mobile-menu-button"
               onClick={() => setSidebarOpen(true)}
               aria-label="Open navigation"
+              aria-expanded={sidebarOpen}
             >
               <Menu size={21} />
             </button>
@@ -332,6 +447,7 @@ export default function FocusPage() {
             </span>
 
             <button
+              type="button"
               className="dashboard-theme-toggle"
               onClick={toggleTheme}
               aria-label={`Switch to ${
@@ -381,10 +497,10 @@ export default function FocusPage() {
                 </span>
                 <span className="stat-label">SESSIONS TODAY</span>
               </div>
+
               <div className="stat-value">{completedToday}</div>
-              <p className="stat-caption">
-                Completed focus sessions
-              </p>
+
+              <p className="stat-caption">Completed focus sessions</p>
             </article>
 
             <article className="dashboard-stat-card">
@@ -394,12 +510,14 @@ export default function FocusPage() {
                 </span>
                 <span className="stat-label">TOTAL FOCUS TIME</span>
               </div>
+
               <div className="stat-value">
                 {Math.floor(totalFocusMinutes / 60)}
                 <span>h</span>{" "}
                 {totalFocusMinutes % 60}
                 <span>m</span>
               </div>
+
               <p className="stat-caption">
                 From completed focus timers
               </p>
@@ -412,10 +530,12 @@ export default function FocusPage() {
                 </span>
                 <span className="stat-label">KEEP IT GOING</span>
               </div>
+
               <div className="stat-value">
                 {completedToday > 0 ? "On" : "Go"}
-                <span>{completedToday > 0 ? "!" : "!"}</span>
+                <span>!</span>
               </div>
+
               <p className="stat-caption">
                 {completedToday > 0
                   ? "You've made progress today"
@@ -447,6 +567,7 @@ export default function FocusPage() {
                 aria-label="Timer mode"
               >
                 <button
+                  type="button"
                   className={mode === "focus" ? "selected" : ""}
                   onClick={() => selectMode("focus")}
                 >
@@ -455,6 +576,7 @@ export default function FocusPage() {
                 </button>
 
                 <button
+                  type="button"
                   className={mode === "shortBreak" ? "selected" : ""}
                   onClick={() => selectMode("shortBreak")}
                 >
@@ -463,6 +585,7 @@ export default function FocusPage() {
                 </button>
 
                 <button
+                  type="button"
                   className={mode === "longBreak" ? "selected" : ""}
                   onClick={() => selectMode("longBreak")}
                 >
@@ -479,7 +602,7 @@ export default function FocusPage() {
                   style={
                     {
                       "--focus-progress": `${progress}%`,
-                    } as React.CSSProperties
+                    } as CSSProperties
                   }
                 >
                   <div className="focus-timer-ring-inner">
@@ -506,6 +629,7 @@ export default function FocusPage() {
 
               <div className="focus-timer-controls">
                 <button
+                  type="button"
                   className="focus-reset-button"
                   onClick={resetTimer}
                   aria-label="Reset timer"
@@ -515,11 +639,13 @@ export default function FocusPage() {
                 </button>
 
                 <button
+                  type="button"
                   className="focus-start-button"
                   onClick={() => {
                     if (remainingSeconds === 0) {
                       setRemainingSeconds(durationMinutes * 60);
                     }
+
                     setRunning((current) => !current);
                   }}
                 >
@@ -540,6 +666,13 @@ export default function FocusPage() {
 
                 <span className="focus-control-spacer" />
               </div>
+
+              {sessionSaveError && (
+                <p role="alert" className="focus-subject-hint">
+                  Your session could not be saved. Check your connection and
+                  Firestore permissions before starting another session.
+                </p>
+              )}
 
               <div className="focus-subject-picker">
                 <label htmlFor="focus-subject">
@@ -591,6 +724,7 @@ export default function FocusPage() {
                   <span>minutes</span>
 
                   <button
+                    type="button"
                     onClick={applyCustomDuration}
                     disabled={
                       running ||
@@ -610,8 +744,11 @@ export default function FocusPage() {
                 <span className="focus-guide-icon">
                   <Sparkles size={21} />
                 </span>
+
                 <span className="card-eyebrow">YOUR FOCUS ROUTINE</span>
+
                 <h3>Make each minute count.</h3>
+
                 <p>
                   Try this simple routine to make your sessions more
                   intentional.
@@ -653,6 +790,7 @@ export default function FocusPage() {
                 </div>
 
                 <h3>{completedToday} of 4 sessions</h3>
+
                 <p>
                   {completedToday >= 4
                     ? "Amazing work. You've reached today's demo goal."
@@ -662,10 +800,7 @@ export default function FocusPage() {
                 <div className="focus-goal-track">
                   <span
                     style={{
-                      width: `${Math.min(
-                        (completedToday / 4) * 100,
-                        100,
-                      )}%`,
+                      width: `${Math.min((completedToday / 4) * 100, 100)}%`,
                     }}
                   />
                 </div>
@@ -703,9 +838,7 @@ export default function FocusPage() {
 
                     <div className="focus-history-copy">
                       <strong>{session.subject}</strong>
-                      <span>
-                        {formatSessionDate(session.completedAt)}
-                      </span>
+                      <span>{formatSessionDate(session.completedAt)}</span>
                     </div>
 
                     <span className="focus-history-duration">
@@ -720,10 +853,12 @@ export default function FocusPage() {
                 <span>
                   <Clock3 size={24} />
                 </span>
+
                 <h4>Your next achievement starts here.</h4>
+
                 <p>
-                  Complete a focus timer to see your first session in
-                  this list.
+                  Complete a focus timer to see your first session in this
+                  list.
                 </p>
               </div>
             )}
@@ -733,6 +868,7 @@ export default function FocusPage() {
             <span>
               BrainScribe <span>·</span> Think smarter. Study better.
             </span>
+
             <span>
               One focused step at a time{" "}
               <span className="footer-spark">✳</span>

@@ -12,6 +12,7 @@ import SchedulePage from "./pages/SchedulePage";
 import FocusPage from "./pages/FocusPage";
 import AnalyticsPage from "./pages/AnalyticsPage";
 import NotesPage from "./pages/NotesPage";
+import SettingsPage from "./pages/SettingsPage";
 function PublicOnlyRoute({ children }: { children: ReactNode }) {
   const { user, loading } = useAuth();
 
@@ -54,6 +55,8 @@ export default function App() {
         <Route path="/focus" element={<FocusPage/>}/>
         <Route path="/analytics" element ={<AnalyticsPage/>}/>
         <Route path="/notes" element={<NotesPage/>}/>
+        <Route path="/settings" element={<SettingsPage/>}/>
+
       </Route>
 
       <Route path="/" element={<Navigate to="/dashboard" replace />} />

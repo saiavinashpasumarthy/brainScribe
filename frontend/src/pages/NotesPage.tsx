@@ -28,12 +28,17 @@ import {
   BookMarked,
   StickyNote,
   CircleHelp,
+  Play,
+  PlayCircle,
+  BookmarkPlus,
+  RefreshCw,
 } from "lucide-react";
 import {
   addDoc,
   collection,
   deleteDoc,
   doc,
+  getDocs,
   onSnapshot,
   updateDoc,
 } from "firebase/firestore";
@@ -57,6 +62,18 @@ type StudyNote = {
   resourceUrl: string;
   pinned: boolean;
   updatedAt: string;
+};
+
+type RecommendedVideo = {
+  videoId: string;
+  title: string;
+  description: string;
+  channelTitle: string;
+  publishedAt: string;
+  thumbnail: string;
+  url: string;
+  subject: string;
+  topic: string;
 };
 
 const navigation = [
@@ -100,6 +117,10 @@ const emptyForm = {
   pinned: false,
 };
 
+const API_BASE_URL = (
+  import.meta.env.VITE_API_BASE_URL || "http://localhost:5000"
+).replace(/\/$/, "");
+
 export default function NotesPage() {
   const { user } = useAuth();
   const { theme, toggleTheme } = useTheme();
@@ -120,6 +141,16 @@ export default function NotesPage() {
   const [form, setForm] = useState(emptyForm);
   const [formError, setFormError] = useState("");
   const [loggingOut, setLoggingOut] = useState(false);
+
+  // AI-powered YouTube recommendations.
+  const [recommendedVideos, setRecommendedVideos] = useState<
+    RecommendedVideo[]
+  >([]);
+  const [loadingVideos, setLoadingVideos] = useState(false);
+  const [videoError, setVideoError] = useState("");
+  const [videoSuccess, setVideoSuccess] = useState("");
+  const [savingVideoId, setSavingVideoId] = useState<string | null>(null);
+  const [savedVideoIds, setSavedVideoIds] = useState<string[]>([]);
 
   const userName =
     user?.displayName?.trim().split(/\s+/)[0] ||
@@ -166,12 +197,6 @@ export default function NotesPage() {
           };
         });
 
-console.log("[Notes] Snapshot status:", {
-  fromCache: snapshot.metadata.fromCache,
-  hasPendingWrites: snapshot.metadata.hasPendingWrites,
-  noteCount: snapshot.size,
-});
-
         setNotes(savedNotes);
         setLoadingNotes(false);
       },
@@ -217,6 +242,7 @@ console.log("[Notes] Snapshot status:", {
   }, [notes, searchQuery, categoryFilter, subjectFilter]);
 
   const pinnedCount = notes.filter((note) => note.pinned).length;
+
   const resourceCount = notes.filter(
     (note) => note.resourceUrl.trim(),
   ).length;
@@ -242,98 +268,83 @@ console.log("[Notes] Snapshot status:", {
     setModalOpen(true);
   }
 
+  function saveNote(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
 
-function saveNote(event: FormEvent<HTMLFormElement>) {
-  event.preventDefault();
-
-  if (!user?.uid) {
-    setFormError("Please sign in to save your notes.");
-    return;
-  }
-
-  const title = form.title.trim();
-  const content = form.content.trim();
-  const resourceUrl = form.resourceUrl.trim();
-
-  if (!title) {
-    setFormError("Please enter a title for your note.");
-    return;
-  }
-
-  if (!content) {
-    setFormError("Please add some note content before saving.");
-    return;
-  }
-
-  if (resourceUrl) {
-    try {
-      const url = new URL(resourceUrl);
-
-      if (url.protocol !== "https:" && url.protocol !== "http:") {
-        setFormError("Resource links must start with http:// or https://.");
-        return;
-      }
-    } catch {
-      setFormError("Please enter a valid resource URL.");
+    if (!user?.uid) {
+      setFormError("Please sign in to save your notes.");
       return;
     }
+
+    const title = form.title.trim();
+    const content = form.content.trim();
+    const resourceUrl = form.resourceUrl.trim();
+
+    if (!title) {
+      setFormError("Please enter a title for your note.");
+      return;
+    }
+
+    if (!content) {
+      setFormError("Please add some note content before saving.");
+      return;
+    }
+
+    if (resourceUrl) {
+      try {
+        const url = new URL(resourceUrl);
+
+        if (url.protocol !== "https:" && url.protocol !== "http:") {
+          setFormError(
+            "Resource links must start with http:// or https://.",
+          );
+          return;
+        }
+      } catch {
+        setFormError("Please enter a valid resource URL.");
+        return;
+      }
+    }
+
+    if (saving) return;
+
+    setSaving(true);
+    setFormError("");
+    setActionError("");
+
+    const noteData = {
+      title,
+      content,
+      subject: form.subject,
+      category: form.category,
+      resourceUrl,
+      pinned: form.pinned,
+      updatedAt: new Date().toISOString(),
+    };
+
+    const writePromise = editingId
+      ? updateDoc(
+          doc(db, "users", user.uid, "notes", editingId),
+          noteData,
+        )
+      : addDoc(collection(db, "users", user.uid, "notes"), noteData);
+
+    // Close the modal immediately for a responsive UI.
+    setModalOpen(false);
+    setEditingId(null);
+    setForm(emptyForm);
+
+    void writePromise
+      .catch((error: unknown) => {
+        console.error("[Notes] Save failed:", error);
+        setActionError(
+          "Your note could not be saved to the server. Please check your connection and try again.",
+        );
+      })
+      .finally(() => {
+        setSaving(false);
+      });
   }
-
-  if (saving) return;
-
-  setSaving(true);
-  setFormError("");
-  setActionError("");
-
-  const startedAt = performance.now();
-
-  const noteData = {
-    title,
-    content,
-    subject: form.subject,
-    category: form.category,
-    resourceUrl,
-    pinned: form.pinned,
-    updatedAt: new Date().toISOString(),
-  };
-
-  console.info("[Notes] Save started");
-
-  const writePromise = editingId
-    ? updateDoc(
-        doc(db, "users", user.uid, "notes", editingId),
-        noteData,
-      )
-    : addDoc(
-        collection(db, "users", user.uid, "notes"),
-        noteData,
-      );
-
-  // Close the modal immediately for a responsive UI.
-  setModalOpen(false);
-  setEditingId(null);
-  setForm(emptyForm);
-
-  void writePromise
-    .then(() => {
-      console.info(
-        `[Notes] Firestore confirmed save in ${(
-          performance.now() - startedAt
-        ).toFixed(0)} ms`,
-      );
-    })
-    .catch((error: unknown) => {
-      console.error("[Notes] Save failed:", error);
-
-      setActionError(
-        "Your note could not be saved to the server. Please check your connection and try again.",
-      );
-    })
-    .finally(() => {
-      setSaving(false);
-    });
-}
-
 
   async function togglePinned(id: string) {
     if (!user?.uid) return;
@@ -350,9 +361,7 @@ function saveNote(event: FormEvent<HTMLFormElement>) {
       });
     } catch (error) {
       console.error("Failed to update pinned status:", error);
-      setActionError(
-        "Couldn't update the pinned status. Please try again.",
-      );
+      setActionError("Couldn't update the pinned status. Please try again.");
     }
   }
 
@@ -370,6 +379,192 @@ function saveNote(event: FormEvent<HTMLFormElement>) {
       setActionError("Couldn't delete this note. Please try again.");
     } finally {
       setDeleting(false);
+    }
+  }
+
+  // Get real YouTube videos based on the user's upcoming study sessions.
+  async function loadRecommendedVideos() {
+    if (!user?.uid) {
+      setVideoError("Please sign in to get recommendations.");
+      return;
+    }
+
+    if (loadingVideos) return;
+
+    setLoadingVideos(true);
+    setVideoError("");
+    setVideoSuccess("");
+
+    try {
+      const token = await user.getIdToken();
+
+      const snapshot = await getDocs(
+        collection(db, "users", user.uid, "studySessions"),
+      );
+
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+
+      const sessions = snapshot.docs
+        .map((sessionDoc) => {
+          const data = sessionDoc.data();
+
+          return {
+            title:
+              typeof data.title === "string" ? data.title.trim() : "",
+            subject:
+              typeof data.subject === "string" ? data.subject.trim() : "",
+            date: typeof data.date === "string" ? data.date : "",
+            completed: data.completed === true,
+          };
+        })
+        .filter((session) => {
+          if (!session.title || !session.subject || session.completed) {
+            return false;
+          }
+
+          if (!session.date) return true;
+
+          const sessionDate = new Date(session.date);
+
+          if (Number.isNaN(sessionDate.getTime())) return true;
+
+          sessionDate.setHours(0, 0, 0, 0);
+          return sessionDate >= today;
+        })
+        .sort((a, b) => {
+          if (!a.date && !b.date) return 0;
+          if (!a.date) return 1;
+          if (!b.date) return -1;
+          return a.date.localeCompare(b.date);
+        })
+        .slice(0, 10)
+        .map(({ title, subject }) => ({ title, subject }));
+
+      if (sessions.length === 0) {
+        setRecommendedVideos([]);
+        setVideoError(
+          "No upcoming study sessions found. Generate a study schedule first, then try again.",
+        );
+        return;
+      }
+
+      const response = await fetch(
+        `${API_BASE_URL}/api/ai/youtube-recommendations`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ sessions }),
+        },
+      );
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(
+          typeof data.message === "string"
+            ? data.message
+            : "Unable to load video recommendations.",
+        );
+      }
+
+      if (!Array.isArray(data.videos)) {
+        throw new Error("The server returned an invalid video list.");
+      }
+
+      const validVideos = data.videos.filter(
+        (video: unknown): video is RecommendedVideo => {
+          if (!video || typeof video !== "object") return false;
+
+          const item = video as Partial<RecommendedVideo>;
+
+          return (
+            typeof item.videoId === "string" &&
+            typeof item.title === "string" &&
+            typeof item.url === "string" &&
+            item.url.startsWith("https://www.youtube.com/watch?v=") &&
+            typeof item.subject === "string" &&
+            typeof item.topic === "string"
+          );
+        },
+      );
+
+      setRecommendedVideos(validVideos);
+    } catch (error) {
+      console.error("Failed to load YouTube recommendations:", error);
+
+      setVideoError(
+        error instanceof Error
+          ? error.message
+          : "Couldn't load recommendations. Please try again.",
+      );
+    } finally {
+      setLoadingVideos(false);
+    }
+  }
+
+  // Save a recommended video in the existing Firestore Resources category.
+  async function saveRecommendedVideo(video: RecommendedVideo) {
+    if (!user?.uid || savingVideoId) return;
+
+    setSavingVideoId(video.videoId);
+    setVideoError("");
+    setVideoSuccess("");
+
+    try {
+      const existingResource = notes.some(
+        (note) =>
+          note.category === "Resources" &&
+          note.resourceUrl === video.url,
+      );
+
+      if (existingResource) {
+        setSavedVideoIds((current) =>
+          current.includes(video.videoId)
+            ? current
+            : [...current, video.videoId],
+        );
+        setVideoSuccess("This video is already saved in your resources.");
+        return;
+      }
+
+      await addDoc(collection(db, "users", user.uid, "notes"), {
+        title: video.title.slice(0, 100),
+        content: [
+          `Recommended for: ${video.subject}`,
+          `Topic: ${video.topic}`,
+          `Channel: ${video.channelTitle || "YouTube"}`,
+          "",
+          video.description || "YouTube learning resource.",
+        ]
+          .join("\n")
+          .slice(0, 10000),
+        subject: subjects.includes(video.subject)
+          ? video.subject
+          : "General",
+        category: "Resources",
+        resourceUrl: video.url,
+        pinned: false,
+        updatedAt: new Date().toISOString(),
+      });
+
+      setSavedVideoIds((current) =>
+        current.includes(video.videoId)
+          ? current
+          : [...current, video.videoId],
+      );
+
+      setVideoSuccess("Video saved to your Resources.");
+    } catch (error) {
+      console.error("Failed to save recommended video:", error);
+      setVideoError(
+        "Couldn't save this video. Please check your connection and try again.",
+      );
+    } finally {
+      setSavingVideoId(null);
     }
   }
 
@@ -541,6 +736,157 @@ function saveNote(event: FormEvent<HTMLFormElement>) {
             </button>
           </section>
 
+          {/* AI-powered YouTube recommendations */}
+          <section className="youtube-recommendations">
+            <div className="youtube-recommendations-heading">
+              <div>
+                <span className="notes-eyebrow youtube-eyebrow">
+                  <Play size={15} /> AI-POWERED LEARNING
+                </span>
+                <h2>Videos for your study plan</h2>
+                <p>
+                  Discover relevant tutorials based on your upcoming study
+                  sessions.
+                </p>
+              </div>
+
+              <button
+                type="button"
+                className="notes-primary-button"
+                onClick={loadRecommendedVideos}
+                disabled={loadingVideos}
+              >
+                {loadingVideos ? (
+                  <RefreshCw className="youtube-spin" size={17} />
+                ) : (
+                  <PlayCircle size={17} />
+                )}
+                {loadingVideos ? "Finding videos..." : "Get recommendations"}
+              </button>
+            </div>
+
+            {videoError && (
+              <p className="notes-form-error" role="alert">
+                {videoError}
+              </p>
+            )}
+
+            {videoSuccess && (
+              <p className="youtube-success" role="status">
+                {videoSuccess}
+              </p>
+            )}
+
+            {loadingVideos && (
+              <div className="youtube-loading" role="status">
+                <RefreshCw className="youtube-spin" size={22} />
+                <p>
+                  Finding useful videos for your upcoming study sessions...
+                </p>
+              </div>
+            )}
+
+            {!loadingVideos &&
+              recommendedVideos.length === 0 &&
+              !videoError && (
+                <div className="youtube-empty">
+                  <span className="youtube-empty-icon">
+                    <Play size={25} />
+                  </span>
+                  <h3>Your next learning resource is one click away.</h3>
+                  <p>
+                    Get recommendations to discover YouTube tutorials matched
+                    to your study schedule.
+                  </p>
+                </div>
+              )}
+
+            {recommendedVideos.length > 0 && (
+              <div className="youtube-video-grid">
+                {recommendedVideos.map((video) => {
+                  const alreadySaved =
+                    savedVideoIds.includes(video.videoId) ||
+                    notes.some(
+                      (note) =>
+                        note.category === "Resources" &&
+                        note.resourceUrl === video.url,
+                    );
+
+                  return (
+                    <article className="youtube-video-card" key={video.videoId}>
+                      <a
+                        className="youtube-thumbnail"
+                        href={video.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        aria-label={`Watch ${video.title} on YouTube`}
+                      >
+                        {video.thumbnail ? (
+                          <img src={video.thumbnail} alt="" loading="lazy" />
+                        ) : (
+                          <span className="youtube-thumbnail-fallback">
+                            <Play size={32} />
+                          </span>
+                        )}
+                        <span className="youtube-play-overlay">
+                          <PlayCircle size={42} />
+                        </span>
+                      </a>
+
+                      <div className="youtube-video-details">
+                        <span className="youtube-video-subject">
+                          {video.subject}
+                        </span>
+                        <h3>{video.title}</h3>
+                        <p className="youtube-video-channel">
+                          {video.channelTitle || "YouTube"}
+                        </p>
+
+                        {video.topic && (
+                          <p className="youtube-video-topic">
+                            Topic: {video.topic}
+                          </p>
+                        )}
+
+                        <div className="youtube-video-actions">
+                          <a
+                            href={video.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="youtube-watch-link"
+                          >
+                            Watch video <ExternalLink size={14} />
+                          </a>
+
+                          <button
+                            type="button"
+                            className="youtube-save-button"
+                            onClick={() => saveRecommendedVideo(video)}
+                            disabled={
+                              alreadySaved || savingVideoId !== null
+                            }
+                            title={
+                              alreadySaved
+                                ? "Already saved to Resources"
+                                : "Save to Resources"
+                            }
+                          >
+                            <BookmarkPlus size={16} />
+                            {alreadySaved
+                              ? "Saved"
+                              : savingVideoId === video.videoId
+                                ? "Saving..."
+                                : "Save"}
+                          </button>
+                        </div>
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+
           <section className="notes-stat-grid" aria-label="Notes overview">
             <article className="notes-stat-card">
               <span className="notes-stat-icon notes-stat-blue">
@@ -552,6 +898,7 @@ function saveNote(event: FormEvent<HTMLFormElement>) {
                 <small>Across your study subjects</small>
               </div>
             </article>
+
             <article className="notes-stat-card">
               <span className="notes-stat-icon notes-stat-purple">
                 <Pin size={20} />
@@ -562,6 +909,7 @@ function saveNote(event: FormEvent<HTMLFormElement>) {
                 <small>Quick access to key ideas</small>
               </div>
             </article>
+
             <article className="notes-stat-card">
               <span className="notes-stat-icon notes-stat-green">
                 <LinkIcon size={20} />
@@ -664,6 +1012,7 @@ function saveNote(event: FormEvent<HTMLFormElement>) {
                           <CategoryIcon size={14} />
                           {note.category}
                         </span>
+
                         <button
                           className={`notes-pin-button ${note.pinned ? "is-pinned" : ""}`}
                           onClick={() => togglePinned(note.id)}
@@ -728,6 +1077,7 @@ function saveNote(event: FormEvent<HTMLFormElement>) {
                     ? "Start your library by creating your first study note."
                     : "Try another search or adjust your filters."}
                 </p>
+
                 {notes.length === 0 ? (
                   <button
                     className="notes-primary-button"
@@ -767,10 +1117,7 @@ function saveNote(event: FormEvent<HTMLFormElement>) {
         <div
           className="notes-modal-backdrop"
           onMouseDown={(event) => {
-            if (
-              event.target === event.currentTarget &&
-              !saving
-            ) {
+            if (event.target === event.currentTarget && !saving) {
               setModalOpen(false);
             }
           }}
@@ -791,6 +1138,7 @@ function saveNote(event: FormEvent<HTMLFormElement>) {
                 </h2>
                 <p>Keep the important details somewhere you can find them.</p>
               </div>
+
               <button
                 className="notes-modal-close"
                 onClick={() => setModalOpen(false)}
@@ -876,7 +1224,8 @@ function saveNote(event: FormEvent<HTMLFormElement>) {
               </label>
 
               <label>
-                Resource URL <span className="notes-optional">(optional)</span>
+                Resource URL{" "}
+                <span className="notes-optional">(optional)</span>
                 <input
                   type="url"
                   value={form.resourceUrl}
@@ -942,10 +1291,7 @@ function saveNote(event: FormEvent<HTMLFormElement>) {
         <div
           className="notes-modal-backdrop"
           onMouseDown={(event) => {
-            if (
-              event.target === event.currentTarget &&
-              !deleting
-            ) {
+            if (event.target === event.currentTarget && !deleting) {
               setDeleteId(null);
             }
           }}

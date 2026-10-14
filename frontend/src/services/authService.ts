@@ -1,12 +1,21 @@
+
 import {
   createUserWithEmailAndPassword,
+  GoogleAuthProvider,
   signInWithEmailAndPassword,
+  signInWithPopup,
   signOut,
   updateProfile,
   type User,
 } from "firebase/auth";
 
 import { auth } from "../config/firebase";
+
+const googleProvider = new GoogleAuthProvider();
+
+googleProvider.setCustomParameters({
+  prompt: "select_account",
+});
 
 export async function registerUser(
   name: string,
@@ -36,6 +45,11 @@ export async function loginUser(
     password,
   );
 
+  return credential.user;
+}
+
+export async function loginWithGoogle(): Promise<User> {
+  const credential = await signInWithPopup(auth, googleProvider);
   return credential.user;
 }
 
