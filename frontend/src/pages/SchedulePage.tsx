@@ -17,6 +17,7 @@ import {
 } from "firebase/firestore";
 import { signOut } from "firebase/auth";
 import {
+  BrainCircuit,
   CalendarDays,
   CalendarCheck,
   ChevronLeft,
@@ -30,7 +31,7 @@ import {
   X,
   BookOpen,
   LayoutDashboard,
-  Timer,
+  NotebookPen,
   ChartNoAxesCombined,
   FileText,
   LogOut,
@@ -41,6 +42,7 @@ import {
   Upload,
   FileUp,
   CalendarClock,
+  Settings
 } from "lucide-react";
 import * as pdfjsLib from "pdfjs-dist";
 import * as mammoth from "mammoth";
@@ -98,12 +100,12 @@ const SUBJECT_COLORS: Record<string, string> = {
 };
 
 const NAV_ITEMS = [
-  { label: "Dashboard", path: "/dashboard", icon: LayoutDashboard },
-  { label: "Subjects", path: "/subjects", icon: BookOpen },
-  { label: "Schedule", path: "/schedule", icon: CalendarDays },
-  { label: "Focus Mode", path: "/focus", icon: Timer },
-  { label: "Analytics", path: "/analytics", icon: ChartNoAxesCombined },
-  { label: "Notes", path: "/notes", icon: FileText },
+  { label: "Overview", icon: LayoutDashboard, route: "/dashboard" },
+  { label: "My Subjects", icon: BookOpen, route: "/subjects" },
+  { label: "Study Schedule", icon: CalendarDays, route: "/schedule" },
+  { label: "Focus Sessions", icon: Clock3, route: "/focus" },
+  { label: "Analytics", icon: ChartNoAxesCombined, route: "/analytics" },
+  { label: "Notes & Resources", icon: NotebookPen, route: "/notes" },
 ];
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
@@ -170,11 +172,7 @@ function getInitialForm(): SessionForm {
   };
 }
 
-const cardStyle: CSSProperties = {
-  background: "var(--surface)",
-  border: "1px solid var(--border)",
-  borderRadius: 18,
-};
+
 
 const primaryButtonStyle: CSSProperties = {
   display: "inline-flex",
@@ -958,22 +956,16 @@ async function saveSession(event: FormEvent<HTMLFormElement>) {
         />
       )}
 
-      <aside className={`dashboard-sidebar ${sidebarOpen ? "sidebar-open" : ""}`}>
+      <aside
+        className={`dashboard-sidebar ${sidebarOpen ? "sidebar-open" : ""}`}
+      >
         <div className="dashboard-brand">
-          <span
-            style={{
-              display: "grid",
-              placeItems: "center",
-              width: 36,
-              height: 36,
-              borderRadius: 12,
-              background: "linear-gradient(135deg, #4F9CF9, #7C83FF)",
-              color: "#fff",
-            }}
-          >
-            <BookOpen size={20} />
+          <span className="dashboard-brand-icon">
+            <BrainCircuit size={23} />
           </span>
-          <span>BrainScribe</span>
+          <span>
+            Brain<span>Scribe</span>
+          </span>
           <button
             className="sidebar-close"
             aria-label="Close navigation"
@@ -985,49 +977,57 @@ async function saveSession(event: FormEvent<HTMLFormElement>) {
 
         <p className="sidebar-section-label">WORKSPACE</p>
 
-        <nav className="sidebar-nav">
-          {NAV_ITEMS.map(({ label, path, icon: Icon }) => (
+        <nav className="sidebar-nav" aria-label="Main navigation">
+          {NAV_ITEMS.map(({ label, icon: Icon, route }) => (
             <button
-              key={path}
-              type="button"
-              className={`sidebar-link ${path === "/schedule" ? "active" : ""}`}
+              key={label}
+              className={`sidebar-link ${route === "/schedule" ? "active" : ""}`}
               onClick={() => {
-                navigate(path);
                 setSidebarOpen(false);
+                navigate(route);
               }}
             >
-              <Icon size={19} />
+              <Icon size={19} strokeWidth={1.8} />
               <span>{label}</span>
-              {path === "/schedule" && <span className="nav-active-indicator" />}
+              {route === "/schedule" && (
+                <span className="nav-active-indicator" />
+              )}
             </button>
           ))}
         </nav>
 
         <div className="sidebar-bottom">
           <div className="sidebar-tip">
-            <CalendarCheck size={19} />
-            <div>
-              <strong>Stay consistent</strong>
-              <p>Small sessions add up to big progress.</p>
-            </div>
+            <span className="sidebar-tip-icon">
+              <BrainCircuit size={18} />
+            </span>
+            <p>Little progress each day adds up to big results.</p>
+            <span className="tip-decoration">✳</span>
           </div>
 
+          <button
+            className="sidebar-link"
+            onClick={() => navigate("/settings")}
+          >
+            <Settings size={19} strokeWidth={1.8} />
+            <span>Settings</span>
+          </button>
+
           <div className="sidebar-profile">
-            <span className="profile-avatar">
-              {(user?.displayName || user?.email || "S").charAt(0).toUpperCase()}
-            </span>
-            <span className="profile-info">
+            <div className="profile-avatar">
+              {firstName.charAt(0).toUpperCase()}
+            </div>
+            <div className="profile-info">
               <strong>{firstName}</strong>
-              <span>{user?.email || "Student account"}</span>
-            </span>
+              <span>Student workspace</span>
+            </div>
             <button
               className="logout-button"
-              type="button"
-              title="Log out"
-              aria-label="Log out"
               onClick={handleLogout}
+              title="Sign out"
+              aria-label="Sign out"
             >
-              <LogOut size={18} />
+              <LogOut size={17} />
             </button>
           </div>
         </div>
@@ -1091,15 +1091,12 @@ async function saveSession(event: FormEvent<HTMLFormElement>) {
             boxSizing: "border-box",
           }}
         >
-          <section
-            style={{
-              ...cardStyle,
-              padding: 24,
-              marginBottom: 20,
-              background:
-                "linear-gradient(120deg, var(--surface), color-mix(in srgb, #4F9CF9 8%, var(--surface)))",
-            }}
-          >
+          
+<section
+  className="dashboard-card schedule-hero-card"
+  style={{ padding: 24, marginBottom: 20 }}
+>
+
             <div
               style={{
                 display: "flex",
@@ -1183,7 +1180,7 @@ async function saveSession(event: FormEvent<HTMLFormElement>) {
             </div>
           </section>
 
-          <section style={{ ...cardStyle, padding: 20, marginBottom: 20 }}>
+<section className="dashboard-card schedule-calendar-card">
             <div
               style={{
                 display: "flex",
@@ -1716,19 +1713,19 @@ Nothing is saved until you approve it.
             ) : visibleSessions.length ? (
               <div style={{ display: "grid", gap: 12 }}>
                 {visibleSessions.map((session) => (
-                  <article
-                    key={session.id}
-                    style={{
-                      display: "flex",
-                      gap: 14,
-                      alignItems: "stretch",
-                      padding: 16,
-                      border: "1px solid var(--border)",
-                      borderRadius: 14,
-                      background: "var(--input-surface)",
-                      opacity: session.completed ? 0.75 : 1,
-                    }}
-                  >
+                  
+<article
+  key={session.id}
+  className="dashboard-card schedule-session-card"
+  style={{
+    display: "flex",
+    gap: 14,
+    alignItems: "stretch",
+    padding: 16,
+    opacity: session.completed ? 0.75 : 1,
+  }}
+>
+
                     <div
                       style={{
                         width: 4,

@@ -74,15 +74,18 @@ const colorOptions = [
 ];
 
 
+
+
 const navigation = [
   { label: "Overview", icon: LayoutDashboard, path: "/dashboard" },
   { label: "My Subjects", icon: BookOpen, path: "/subjects" },
-  { label: "Exams", icon: CalendarDays, path: "/exams" },
   { label: "Study Schedule", icon: CalendarDays, path: "/schedule" },
   { label: "Focus Sessions", icon: Clock3, path: "/focus" },
   { label: "Analytics", icon: ChartNoAxesCombined, path: "/analytics" },
   { label: "Notes & Resources", icon: NotebookPen, path: "/notes" },
 ];
+
+
 
 
 const emptyForm: SubjectForm = {

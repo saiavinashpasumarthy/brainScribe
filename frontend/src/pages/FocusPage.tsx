@@ -56,13 +56,7 @@ const navigation = [
   { label: "Notes & Resources", icon: NotebookPen, route: "/notes" },
 ];
 
-const subjectOptions = [
-  "Data Structures",
-  "Database Systems",
-  "Computer Networks",
-  "Operating Systems",
-  "Mathematics",
-];
+
 
 const modes: Record<
   FocusMode,
@@ -116,7 +110,8 @@ export default function FocusPage() {
   const [remainingSeconds, setRemainingSeconds] = useState(25 * 60);
   const [running, setRunning] = useState(false);
 
-  const [selectedSubject, setSelectedSubject] = useState(subjectOptions[0]);
+const [subjectOptions, setSubjectOptions] = useState<string[]>([]);
+const [selectedSubject, setSelectedSubject] = useState("");
   const [customMinutes, setCustomMinutes] = useState("25");
 
   const [sessions, setSessions] = useState<FocusSession[]>([]);
@@ -190,6 +185,46 @@ export default function FocusPage() {
       },
       (error) => {
         console.error("Failed to load focus sessions:", error);
+      },
+    );
+
+    return unsubscribe;
+  }, [user?.uid]);
+
+  // Load subjects from the signed-in user's study schedule.
+  useEffect(() => {
+    if (!user?.uid) {
+      setSubjectOptions([]);
+      setSelectedSubject("");
+      return;
+    }
+
+    const unsubscribe = onSnapshot(
+      collection(db, "users", user.uid, "studySessions"),
+      (snapshot) => {
+        const subjects = Array.from(
+          new Set(
+            snapshot.docs
+              .map((document) => document.data().subject)
+              .filter(
+                (subject): subject is string =>
+                  typeof subject === "string" &&
+                  subject.trim().length > 0,
+              )
+              .map((subject) => subject.trim()),
+          ),
+        ).sort((a, b) => a.localeCompare(b));
+
+        setSubjectOptions(subjects);
+
+        setSelectedSubject((current) =>
+          subjects.includes(current) ? current : subjects[0] ?? "",
+        );
+      },
+      (error) => {
+        console.error("Failed to load study subjects:", error);
+        setSubjectOptions([]);
+        setSelectedSubject("");
       },
     );
 
@@ -649,6 +684,7 @@ if (!userId) {
                     setRunning((current) => !current);
                   }}
                 >
+
                   {running ? (
                     <>
                       <Pause size={18} fill="currentColor" />
@@ -680,26 +716,56 @@ if (!userId) {
                   Focusing on
                 </label>
 
-                <select
-                  id="focus-subject"
-                  value={selectedSubject}
-                  onChange={(event) =>
-                    setSelectedSubject(event.target.value)
-                  }
-                  disabled={running}
-                >
-                  {subjectOptions.map((subject) => (
-                    <option key={subject} value={subject}>
-                      {subject}
-                    </option>
-                  ))}
-                </select>
+ 
+<select
+  id="focus-subject"
+  value={selectedSubject}
+  onChange={(event) => setSelectedSubject(event.target.value)}
+  disabled={running || subjectOptions.length === 0}
+>
+  {subjectOptions.length === 0 ? (
+    <option value="">
+      No syllabus subjects available
+    </option>
+  ) : (
+    subjectOptions.map((subject) => (
+      <option key={subject} value={subject}>
+        {subject}
+      </option>
+    ))
+  )}
+</select>
 
-                {running && (
-                  <p className="focus-subject-hint">
-                    Pause the timer to change your subject.
-                  </p>
-                )}
+{subjectOptions.length === 0 && (
+  <p className="focus-subject-hint">
+    Add or generate a study plan from your syllabus in the Schedule
+    page to see your subjects here.
+    <button
+      type="button"
+      onClick={() => navigate("/schedule")}
+      style={{
+        display: "block",
+        marginTop: 8,
+        padding: 0,
+        background: "none",
+        border: "none",
+        color: "var(--accent, #4F9CF9)",
+        cursor: "pointer",
+        font: "inherit",
+        fontWeight: 600,
+      }}
+    >
+      Go to Study Schedule →
+    </button>
+  </p>
+)}
+
+{running && (
+  <p className="focus-subject-hint">
+    Pause the timer to change your subject.
+  </p>
+)}
+
               </div>
 
               <div className="focus-custom-duration">

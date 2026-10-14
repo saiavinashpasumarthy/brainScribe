@@ -10601,3 +10601,157 @@ body:has(.register-panel) {
     transition: none !important;
   }
 }
+
+/* BrainScribe — Schedule page card styling */
+
+.schedule-hero-card {
+  background:
+    radial-gradient(
+      circle at 100% 0%,
+      rgba(79, 156, 249, 0.09),
+      transparent 38%
+    ),
+    linear-gradient(
+      145deg,
+      rgba(28, 42, 59, 0.81),
+      rgba(20, 31, 46, 0.75)
+    );
+}
+
+.schedule-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 24px;
+}
+
+.schedule-summary-card {
+  min-width: 0;
+  padding: 16px;
+}
+
+.schedule-summary-card .stat-value {
+  margin-top: 15px;
+  font-size: clamp(1.35rem, 1.8vw, 1.8rem);
+  overflow-wrap: anywhere;
+}
+
+.schedule-summary-card .stat-label {
+  line-height: 1.5;
+}
+
+.schedule-summary-card .stat-caption {
+  min-height: 0;
+  margin-bottom: 0;
+}
+
+.schedule-calendar-card {
+  padding: 20px;
+  margin-bottom: 20px;
+}
+
+.schedule-session-card {
+  border-radius: 14px;
+  transition:
+    transform 180ms ease,
+    border-color 180ms ease,
+    box-shadow 180ms ease;
+}
+
+.schedule-session-card:hover {
+  transform: translateY(-2px);
+  border-color: rgba(79, 156, 249, 0.3);
+}
+
+.schedule-syllabus-card {
+  border: 1px solid rgba(151, 180, 213, 0.13);
+  border-radius: 14px;
+  background:
+    radial-gradient(
+      circle at 100% 0%,
+      rgba(79, 156, 249, 0.08),
+      transparent 48%
+    ),
+    rgba(255, 255, 255, 0.018);
+}
+
+:root[data-theme="light"] .schedule-hero-card {
+  background:
+    radial-gradient(
+      circle at 100% 0%,
+      rgba(79, 156, 249, 0.08),
+      transparent 38%
+    ),
+    linear-gradient(
+      145deg,
+      rgba(255, 255, 255, 0.94),
+      rgba(246, 249, 254, 0.88)
+    );
+}
+
+:root[data-theme="light"] .schedule-syllabus-card {
+  border-color: rgba(91, 123, 163, 0.16);
+  background:
+    radial-gradient(
+      circle at 100% 0%,
+      rgba(79, 156, 249, 0.07),
+      transparent 48%
+    ),
+    rgba(255, 255, 255, 0.72);
+}
+
+@media (max-width: 900px) {
+  .schedule-summary-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 560px) {
+  .schedule-hero-card {
+    padding: 18px !important;
+  }
+
+  .schedule-summary-grid {
+    gap: 10px;
+  }
+
+  .schedule-summary-card {
+    padding: 13px;
+  }
+
+  .schedule-calendar-card {
+    padding: 15px;
+  }
+
+  .schedule-syllabus-card {
+    padding: 15px !important;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .schedule-session-card {
+    transition: none;
+  }
+
+  .schedule-session-card:hover {
+    transform: none;
+  }
+}
+
+/* Smooth scrolling across BrainScribe */
+html {
+  scroll-behavior: smooth;
+  scroll-padding-top: 88px;
+}
+
+/* Keep scrolling responsive and prevent horizontal overflow */
+body {
+  overflow-x: hidden;
+}
+
+/* Respect accessibility preferences */
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+}
