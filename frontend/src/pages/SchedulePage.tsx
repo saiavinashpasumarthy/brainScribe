@@ -14,6 +14,8 @@ import {
   onSnapshot,
   updateDoc,
   writeBatch,
+  runTransaction,
+  serverTimestamp,
 } from "firebase/firestore";
 import { signOut } from "firebase/auth";
 import {
@@ -76,15 +78,78 @@ type GenerateStudyPlanResponse = {
   provider?: "gemini" | "groq";
   warning?: string;
 };
-
+type GeneratedPlanDetails = {
+  mode: "daily" | "weekly" | "syllabus";
+  startDate: string;
+  endDate: string;
+  subjects: string[];
+  warning: string;
+  provider?: "gemini" | "groq";
+};
 
 type GenerateStudyPlanRequest = {
   mode: "weekly" | "daily" | "syllabus";
   startDate: string;
   deadline?: string;
   syllabusText?: string;
+  subjects?: string[];
 };
+const hasTimeConflict = (
+  date: string,
+  startTime: string,
+  duration: number,
+  sessions: StudySession[],
+  excludeSessionId?: string,
+): boolean => {
+  const [hours, minutes] = startTime.split(":").map(Number);
 
+  if (
+    !Number.isInteger(hours) ||
+    !Number.isInteger(minutes) ||
+    hours < 0 ||
+    hours > 23 ||
+    minutes < 0 ||
+    minutes > 59 ||
+    !Number.isFinite(duration) ||
+    duration <= 0
+  ) {
+    return true;
+  }
+
+  const proposedStart = hours * 60 + minutes;
+  const proposedEnd = proposedStart + duration;
+
+  return sessions.some((session) => {
+    if (
+      session.id === excludeSessionId ||
+      session.date !== date
+    ) {
+      return false;
+    }
+
+    const [existingHours, existingMinutes] = session.startTime
+      .split(":")
+      .map(Number);
+
+    if (
+      !Number.isInteger(existingHours) ||
+      !Number.isInteger(existingMinutes) ||
+      !Number.isFinite(session.duration) ||
+      session.duration <= 0
+    ) {
+      return true;
+    }
+
+    const existingStart = existingHours * 60 + existingMinutes;
+    const existingEnd = existingStart + session.duration;
+
+    // Sessions that touch at an endpoint do not overlap.
+    return (
+      proposedStart < existingEnd &&
+      existingStart < proposedEnd
+    );
+  });
+};
 const API_BASE_URL = (
   ((import.meta as any).env?.VITE_API_URL || "http://localhost:5000")
 ).replace(/\/+$/, "");
@@ -513,6 +578,8 @@ export default function SchedulePage() {
   const [savingPlan, setSavingPlan] = useState(false);
   const [generatedPlan, setGeneratedPlan] =
     useState<GeneratedStudySession[] | null>(null);
+  const [generatedPlanDetails, setGeneratedPlanDetails] =
+  useState<GeneratedPlanDetails | null>(null);
   const [aiProvider, setAiProvider] =
     useState<"gemini" | "groq" | null>(null);
   const [aiError, setAiError] = useState("");
@@ -521,73 +588,305 @@ export default function SchedulePage() {
   const [syllabusDeadline, setSyllabusDeadline] = useState("");
   const [syllabusError, setSyllabusError] = useState("");
   const [syllabusWarning, setSyllabusWarning] = useState("");
+  
+const [userSubjects, setUserSubjects] = useState<string[]>([]);
+
 
   const firstName =
     user?.displayName?.trim().split(/\s+/)[0] || "Student";
 
-  useEffect(() => {
-    if (!user?.uid) {
-      setSessions([]);
+useEffect(() => {
+  if (!user?.uid) {
+    setSessions([]);
+    setLoadingSessions(false);
+    return;
+  }
+
+  setLoadingSessions(true);
+  setScheduleError("");
+
+  const sessionsRef = collection(db, "users", user.uid, "studySessions");
+
+  const unsubscribe = onSnapshot(
+    sessionsRef,
+    (snapshot) => {
+      const loadedSessions: StudySession[] = snapshot.docs.map(
+        (sessionDoc) => {
+          const data = sessionDoc.data();
+
+          const priority: Priority =
+            data.priority === "High" ||
+            data.priority === "Medium" ||
+            data.priority === "Low"
+              ? data.priority
+              : "Medium";
+
+          return {
+            id: sessionDoc.id,
+            title: typeof data.title === "string" ? data.title : "",
+            subject:
+              typeof data.subject === "string" ? data.subject : "",
+            date: typeof data.date === "string" ? data.date : "",
+            startTime:
+              typeof data.startTime === "string" ? data.startTime : "09:00",
+            duration:
+              typeof data.duration === "number" ? data.duration : 45,
+            priority,
+            completed: data.completed === true,
+            notes: typeof data.notes === "string" ? data.notes : "",
+          };
+        },
+      );
+
+      loadedSessions.sort((a, b) =>
+        `${a.date}T${a.startTime}`.localeCompare(
+          `${b.date}T${b.startTime}`,
+        ),
+      );
+
+      setSessions(loadedSessions);
       setLoadingSessions(false);
-      return;
-    }
 
-    setLoadingSessions(true);
-    setScheduleError("");
+      // Automatically reschedule overdue, incomplete sessions.
+      const now = new Date();
+      const today = [
+        now.getFullYear(),
+        String(now.getMonth() + 1).padStart(2, "0"),
+        String(now.getDate()).padStart(2, "0"),
+      ].join("-");
 
-    const sessionsRef = collection(db, "users", user.uid, "studySessions");
+      const currentTime = [
+        String(now.getHours()).padStart(2, "0"),
+        String(now.getMinutes()).padStart(2, "0"),
+      ].join(":");
 
-    const unsubscribe = onSnapshot(
-      sessionsRef,
-      (snapshot) => {
-        const loadedSessions: StudySession[] = snapshot.docs.map(
-          (sessionDoc) => {
-            const data = sessionDoc.data();
+      const overdueSessions = snapshot.docs
+        .filter((sessionDoc) => {
+          const data = sessionDoc.data();
 
-            const priority: Priority =
-              data.priority === "High" ||
-              data.priority === "Medium" ||
-              data.priority === "Low"
-                ? data.priority
-                : "Medium";
+          return (
+            typeof data.date === "string" &&
+            data.date.length === 10 &&
+            data.date < today &&
+            data.completed !== true
+          );
+        })
+        .sort((a, b) => {
+          const aData = a.data();
+          const bData = b.data();
 
-            return {
-              id: sessionDoc.id,
-              title: typeof data.title === "string" ? data.title : "",
-              subject:
-                typeof data.subject === "string" ? data.subject : "",
-              date: typeof data.date === "string" ? data.date : "",
-              startTime:
-                typeof data.startTime === "string" ? data.startTime : "09:00",
-              duration:
-                typeof data.duration === "number" ? data.duration : 45,
-              priority,
-              completed: data.completed === true,
-              notes: typeof data.notes === "string" ? data.notes : "",
-            };
-          },
-        );
+          return `${aData.date}T${aData.startTime ?? "09:00"}`.localeCompare(
+            `${bData.date}T${bData.startTime ?? "09:00"}`,
+          );
+        });
+      if (overdueSessions.length > 0) {
+        const pad = (value: number) => String(value).padStart(2, "0");
 
-        loadedSessions.sort((a, b) =>
-          `${a.date}T${a.startTime}`.localeCompare(
-            `${b.date}T${b.startTime}`,
+        const formatDateKey = (date: Date) =>
+          `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+
+        const formatTimeKey = (minutes: number) =>
+          `${pad(Math.floor(minutes / 60))}:${pad(minutes % 60)}`;
+
+        // Reserve slots locally so overdue sessions don't overlap each other.
+        const reservedSessions = [...loadedSessions];
+
+        const plannedUpdates: Array<{
+          ref: (typeof overdueSessions)[number]["ref"];
+          date: string;
+          startTime: string;
+        }> = [];
+
+        for (const sessionDoc of overdueSessions) {
+          const data = sessionDoc.data();
+
+          const duration =
+            typeof data.duration === "number" &&
+            Number.isFinite(data.duration) &&
+            data.duration >= 5 &&
+            data.duration <= 480
+              ? data.duration
+              : 45;
+
+          const preferredTime =
+            typeof data.startTime === "string" &&
+            /^([01]\d|2[0-3]):[0-5]\d$/.test(data.startTime)
+              ? data.startTime
+              : "09:00";
+
+          const preferredMinutes =
+            Number(preferredTime.slice(0, 2)) * 60 +
+            Number(preferredTime.slice(3, 5));
+
+          const firstDate = new Date(
+            now.getFullYear(),
+            now.getMonth(),
+            now.getDate(),
+          );
+
+          if (preferredTime <= currentTime) {
+            firstDate.setDate(firstDate.getDate() + 1);
+          }
+
+          // Try the original time first, then 30-minute slots from 06:00–22:00.
+          const candidateMinutes = [
+            preferredMinutes,
+            ...Array.from(
+              { length: 33 },
+              (_, index) => 6 * 60 + index * 30,
+            ).filter((minutes) => minutes !== preferredMinutes),
+          ].filter(
+            (minutes) =>
+              minutes >= 0 &&
+              minutes + duration <= 24 * 60,
+          );
+
+          let assigned: { date: string; startTime: string } | null = null;
+
+          // Search up to 30 days ahead.
+          for (let dayOffset = 0; dayOffset < 30 && !assigned; dayOffset++) {
+            const targetDate = new Date(firstDate);
+            targetDate.setDate(targetDate.getDate() + dayOffset);
+
+            const dateKey = formatDateKey(targetDate);
+
+            for (const minutes of candidateMinutes) {
+              const startTime = formatTimeKey(minutes);
+
+              if (dateKey === today && startTime <= currentTime) {
+                continue;
+              }
+
+              if (
+                hasTimeConflict(
+                  dateKey,
+                  startTime,
+                  duration,
+                  reservedSessions,
+                  sessionDoc.id,
+                )
+              ) {
+                continue;
+              }
+
+              assigned = { date: dateKey, startTime };
+
+              reservedSessions.push({
+                id: sessionDoc.id,
+                title: typeof data.title === "string" ? data.title : "",
+                subject: typeof data.subject === "string" ? data.subject : "",
+                date: dateKey,
+                startTime,
+                duration,
+                priority:
+                  data.priority === "High" ||
+                  data.priority === "Medium" ||
+                  data.priority === "Low"
+                    ? data.priority
+                    : "Medium",
+                completed: false,
+                notes: typeof data.notes === "string" ? data.notes : "",
+              });
+
+              plannedUpdates.push({
+                ref: sessionDoc.ref,
+                date: dateKey,
+                startTime,
+              });
+
+              break;
+            }
+          }
+
+          if (!assigned) {
+            console.warn(
+              `[Schedule] No available time slot found within 30 days for session ${sessionDoc.id}.`,
+            );
+          }
+        }
+
+        void Promise.all(
+          plannedUpdates.map(({ ref, date, startTime }) =>
+            runTransaction(db, async (transaction) => {
+              const currentSnapshot = await transaction.get(ref);
+
+              if (!currentSnapshot.exists()) return;
+
+              const currentData = currentSnapshot.data();
+
+              // Don't reschedule a session that was completed or already moved.
+              if (
+                currentData.completed === true ||
+                typeof currentData.date !== "string" ||
+                currentData.date.length !== 10 ||
+                currentData.date >= today
+              ) {
+                return;
+              }
+
+              // Preserve all other fields.
+              transaction.update(ref, { date, startTime });
+            }),
           ),
-        );
+        ).catch((error) => {
+          console.error(
+            "[Schedule] Failed to reschedule overdue sessions:",
+            error,
+          );
 
-        setSessions(loadedSessions);
-        setLoadingSessions(false);
-      },
-      (error) => {
-        console.error("[Schedule] Failed to load sessions:", error);
-        setScheduleError(
-          "Couldn't load your study sessions. Check your connection and Firestore rules.",
-        );
-        setLoadingSessions(false);
-      },
-    );
+          setScheduleError(
+            "Couldn't automatically reschedule missed sessions. Please refresh and try again.",
+          );
+        });
+      }
 
-    return unsubscribe;
-  }, [user?.uid]);
+
+    },
+    (error) => {
+      console.error("[Schedule] Failed to load sessions:", error);
+      setScheduleError(
+        "Couldn't load your study sessions. Check your connection and Firestore rules.",
+      );
+      setLoadingSessions(false);
+    },
+  );
+
+  return unsubscribe;
+}, [user?.uid]);
+
+useEffect(() => {
+  if (!user?.uid) {
+    setUserSubjects([]);
+    return;
+  }
+
+  const subjectsRef = collection(db, "users", user.uid, "subjects");
+
+  const unsubscribe = onSnapshot(
+    subjectsRef,
+    (snapshot) => {
+      const subjects = snapshot.docs
+        .map((subjectDoc) => subjectDoc.data().name)
+        .filter(
+          (name): name is string =>
+            typeof name === "string" && name.trim().length > 0,
+        )
+        .map((name) => name.trim());
+
+      setUserSubjects(
+        Array.from(new Set(subjects)).sort((a, b) =>
+          a.localeCompare(b),
+        ),
+      );
+    },
+    (error) => {
+      console.error("Failed to load subjects for AI planning:", error);
+      setUserSubjects([]);
+    },
+  );
+
+  return unsubscribe;
+}, [user?.uid]);
 
   const weekDates = useMemo(() => {
     const start = getWeekStart(selectedDate);
@@ -678,45 +977,77 @@ export default function SchedulePage() {
     setModalOpen(true);
   }
 
-  const handleGenerateStudyPlan = async (mode: "weekly" | "daily") => {
-    if (!auth.currentUser?.uid) {
-      setAiError("Please sign in again before generating a study plan.");
+const handleGenerateStudyPlan = async (mode: "weekly" | "daily") => {
+  if (!auth.currentUser?.uid) {
+    setAiError("Please sign in again before generating a study plan.");
+    return;
+  }
+
+  if (userSubjects.length === 0) {
+    setAiError(
+      "Add at least one subject in My Subjects before generating a study plan.",
+    );
+    return;
+  }
+
+  setGeneratingPlan(true);
+  setAiError("");
+  setGeneratedPlan(null);
+  setAiProvider(null);
+  setSyllabusWarning("");
+
+  try {
+    const startDate =
+      mode === "weekly"
+        ? toDateKey(getWeekStart(selectedDate))
+        : dateOffset(0);
+
+    const result = await requestStudyPlan({
+      mode,
+      startDate,
+      subjects: userSubjects,
+    });
+
+    if (result.sessions.length === 0) {
+      setAiError("The AI did not generate any sessions. Please try again.");
       return;
     }
 
-    setGeneratingPlan(true);
-    setAiError("");
-    setGeneratedPlan(null);
-    setAiProvider(null);
-    setSyllabusWarning("");
+setGeneratedPlan(result.sessions);
+setAiProvider(result.provider ?? null);
+setSyllabusWarning(result.warning ?? "");
 
-    try {
-      const startDate =
-        mode === "weekly"
-          ? toDateKey(getWeekStart(selectedDate))
-          : dateOffset(0);
+const endDate =
+  mode === "daily"
+    ? startDate
+    : toDateKey(
+        new Date(
+          parseDate(startDate).getTime() + 6 * 24 * 60 * 60 * 1000,
+        ),
+      );
 
-      const result = await requestStudyPlan({ mode, startDate });
+setGeneratedPlanDetails({
+  mode,
+  startDate,
+  endDate,
+  subjects: result.subjects ?? [
+    ...new Set(result.sessions.map((session) => session.subject)),
+  ],
+  warning: result.warning ?? "",
+  provider: result.provider,
+});
+  } catch (error: unknown) {
+    const message =
+      error instanceof Error
+        ? error.message
+        : "An unexpected error occurred.";
 
-      if (result.sessions.length === 0) {
-        setAiError("The AI did not generate any sessions. Please try again.");
-        return;
-      }
+    setAiError(`Couldn't generate your study plan: ${message}`);
+  } finally {
+    setGeneratingPlan(false);
+  }
+};
 
-      setGeneratedPlan(result.sessions);
-      setAiProvider(result.provider ?? null);
-      setSyllabusWarning(result.warning ?? "");
-    } catch (error: unknown) {
-      const message =
-        error instanceof Error
-          ? error.message
-          : "An unexpected error occurred.";
-
-      setAiError(`Couldn't generate your study plan: ${message}`);
-    } finally {
-      setGeneratingPlan(false);
-    }
-  };
 
   const handleGenerateSyllabusPlan = async () => {
     if (!auth.currentUser?.uid) {
@@ -762,10 +1093,20 @@ export default function SchedulePage() {
         );
         return;
       }
+setGeneratedPlan(result.sessions);
+setAiProvider(result.provider ?? null);
+setSyllabusWarning(result.warning ?? "");
 
-      setGeneratedPlan(result.sessions);
-      setAiProvider(result.provider ?? null);
-      setSyllabusWarning(result.warning ?? "");
+setGeneratedPlanDetails({
+  mode: "syllabus",
+  startDate: dateOffset(0),
+  endDate: syllabusDeadline,
+  subjects: result.subjects ?? [
+    ...new Set(result.sessions.map((session) => session.subject)),
+  ],
+  warning: result.warning ?? "",
+  provider: result.provider,
+});
     } catch (error: unknown) {
       const message =
         error instanceof Error
@@ -778,39 +1119,69 @@ export default function SchedulePage() {
     }
   };
 
-  const handleSaveGeneratedPlan = async () => {
-    const uid = auth.currentUser?.uid;
+const handleSaveGeneratedPlan = async () => {
+  const uid = auth.currentUser?.uid;
 
-    if (!uid || !generatedPlan?.length) return;
+  if (!uid || !generatedPlan?.length || !generatedPlanDetails) {
+    return;
+  }
 
-    setSavingPlan(true);
-    setAiError("");
+  setSavingPlan(true);
+  setAiError("");
 
-    try {
-      const sessionsRef = collection(db, "users", uid, "studySessions");
-      const batch = writeBatch(db);
+  try {
+    const sessionsRef = collection(db, "users", uid, "studySessions");
+    const historyRef = doc(
+      collection(db, "users", uid, "studyPlanHistory"),
+    );
 
-      generatedPlan.forEach((session) => {
-        const sessionRef = doc(sessionsRef);
-        batch.set(sessionRef, { ...session, completed: false });
+    const batch = writeBatch(db);
+
+    generatedPlan.forEach((session) => {
+      const sessionRef = doc(sessionsRef);
+
+      batch.set(sessionRef, {
+        ...session,
+        completed: false,
       });
+    });
 
-      await batch.commit();
+const { provider, ...historyDetails } = generatedPlanDetails;
 
-      setGeneratedPlan(null);
-      setAiProvider(null);
-      setSyllabusWarning("");
-    } catch (error: unknown) {
-      const message =
-        error instanceof Error
-          ? error.message
-          : "An unexpected error occurred.";
+batch.set(historyRef, {
+  ...historyDetails,
+  ...(provider ? { provider } : {}),
+  title:
+        generatedPlanDetails.mode === "daily"
+          ? "Daily Study Plan"
+          : generatedPlanDetails.mode === "weekly"
+            ? "Weekly Study Plan"
+            : "Syllabus Study Plan",
+      sessions: generatedPlan.map((session) => ({
+        ...session,
+        completed: false,
+      })),
+      sessionCount: generatedPlan.length,
+      createdAt: serverTimestamp(),
+    });
 
-      setAiError(`Couldn't save the study plan: ${message}`);
-    } finally {
-      setSavingPlan(false);
-    }
-  };
+    await batch.commit();
+
+    setGeneratedPlan(null);
+    setGeneratedPlanDetails(null);
+    setAiProvider(null);
+    setSyllabusWarning("");
+  } catch (error: unknown) {
+    const message =
+      error instanceof Error
+        ? error.message
+        : "An unexpected error occurred.";
+
+    setAiError(`Couldn't save the study plan: ${message}`);
+  } finally {
+    setSavingPlan(false);
+  }
+};
 
 async function saveSession(event: FormEvent<HTMLFormElement>) {
   event.preventDefault();
@@ -1688,6 +2059,7 @@ Nothing is saved until you approve it.
                       className="ai-planner-btn ai-planner-btn--secondary"
                       onClick={() => {
                         setGeneratedPlan(null);
+                        setGeneratedPlanDetails(null);
                         setAiProvider(null);
                         setAiError("");
                         setSyllabusWarning("");

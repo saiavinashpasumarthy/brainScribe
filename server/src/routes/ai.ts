@@ -4,19 +4,16 @@ import {
   requireAuth,
   type AuthenticatedRequest,
 } from "../middleware/requireAuth.js";
-import { generateAIResponse } from "../services/aiService.js";
+import {
+  generateAIResponse,
+  generateStudyPlanResponse,
+  generateSubjectExtractionResponse,
+} from "../services/aiService.js";
 
 const router = Router();
 
 type PlanMode = "weekly" | "daily" | "syllabus";
 
-const DEFAULT_SUBJECTS = [
-  "Data Structures",
-  "Database Systems",
-  "Computer Networks",
-  "Operating Systems",
-  "Mathematics",
-];
 
 const VALID_PRIORITIES = ["High", "Medium", "Low"] as const;
 
@@ -92,7 +89,13 @@ router.post(
   requireAuth,
   async (req: AuthenticatedRequest, res) => {
     try {
-      const { mode, startDate, deadline, syllabusText } = req.body ?? {};
+      const {
+  mode,
+  startDate,
+  deadline,
+  syllabusText,
+  subjects: requestedSubjects,
+} = req.body ?? {};
 
       if (!["weekly", "daily", "syllabus"].includes(mode)) {
         res.status(400).json({
@@ -109,7 +112,34 @@ router.post(
         });
         return;
       }
+let userSubjects: string[] = [];
 
+if (mode !== "syllabus") {
+  if (
+    !Array.isArray(requestedSubjects) ||
+    requestedSubjects.length === 0 ||
+    requestedSubjects.length > 50 ||
+    !requestedSubjects.every(
+      (subject: unknown) =>
+        typeof subject === "string" &&
+        subject.trim().length > 0 &&
+        subject.trim().length <= 120,
+    )
+  ) {
+    res.status(400).json({
+      success: false,
+      message:
+        "Provide between 1 and 50 valid saved subjects to generate a study plan.",
+    });
+    return;
+  }
+
+  userSubjects = [
+    ...new Set(
+      requestedSubjects.map((subject: string) => subject.trim()),
+    ),
+  ];
+}
       if (mode === "syllabus") {
         if (!isDateKey(deadline) || deadline < startDate) {
           res.status(400).json({
@@ -145,18 +175,18 @@ router.post(
                 .slice(0, 10)
             : deadline;
 
-      const syllabusInstructions =
-        mode === "syllabus"
-          ? `
+
+const syllabusInstructions =
+  mode === "syllabus"
+    ? `
 SYLLABUS SUBJECT EXTRACTION — CRITICAL:
 - Read the supplied syllabus carefully.
 - Identify the actual academic subject or subjects from its title,
   headings, course name, units, and topics.
 - Extract the subject names from the syllabus itself.
 - Do NOT use a predefined subject list.
-- Do NOT assign unrelated subjects such as Mathematics,
-  Operating Systems, or Database Systems unless they actually
-  appear in this syllabus.
+- Do NOT assign unrelated subjects unless they actually appear
+  in this syllabus.
 - If the document represents one course, use that course's
   actual subject name for its relevant sessions.
 - If it clearly contains multiple courses, identify each course
@@ -166,9 +196,10 @@ SYLLABUS SUBJECT EXTRACTION — CRITICAL:
 - Return a "subjects" array containing the extracted subject names.
 - Every session's "subject" must exactly match one entry in "subjects".
 `
-          : `
-SUBJECT RULES:
-- Use only these subjects: ${DEFAULT_SUBJECTS.join(", ")}.
+    : `
+PERSONALIZED SUBJECT RULES:
+- Use only these subjects: ${userSubjects.join(", ")}.
+- Do not introduce subjects outside this list.
 - Every session's subject must exactly match one of these names.
 `;
 
@@ -187,7 +218,7 @@ ${
   mode === "syllabus"
     ? `UPLOADED SYLLABUS:
 ${syllabusText}`
-    : `Available subjects: ${DEFAULT_SUBJECTS.join(", ")}`
+    : `Available subjects: ${userSubjects.join(", ")}`
 }
 
 Requirements:
@@ -211,8 +242,8 @@ Requirements:
 
 - In syllabus mode, "subjects" must contain the real subject names
   identified from the uploaded syllabus.
-- In daily and weekly mode, "subjects" must contain the available
-  default subjects.
+- In daily and weekly mode, "subjects" must contain exactly the
+  available personalized subjects supplied in the request.
 - Every session date must fall between ${startDate} and ${endDate},
   inclusive.
 - Use 24-hour HH:mm format.
@@ -226,39 +257,43 @@ Requirements:
 - Use an empty warning string if no caveat is needed.
 `;
 
-      const rawResponse = await generateAIResponse(prompt);
+const rawResponse = await generateStudyPlanResponse(prompt);
       const parsed = extractJson(rawResponse) as {
         subjects?: unknown;
         sessions?: unknown;
         warning?: unknown;
       };
 
-      let allowedSubjects: string[];
 
-      if (mode === "syllabus") {
-        if (
-          !Array.isArray(parsed.subjects) ||
-          parsed.subjects.length === 0 ||
-          !parsed.subjects.every(
-            (subject) =>
-              typeof subject === "string" && subject.trim().length > 0,
-          )
-        ) {
-          throw new Error(
-            "The AI did not extract valid subject names from the syllabus.",
-          );
-        }
+let allowedSubjects: string[];
 
-        allowedSubjects = [
-          ...new Set(
-            parsed.subjects.map((subject) =>
-              (subject as string).trim().slice(0, 120),
-            ),
-          ),
-        ];
-      } else {
-        allowedSubjects = DEFAULT_SUBJECTS;
-      }
+if (mode === "syllabus") {
+  if (
+    !Array.isArray(parsed.subjects) ||
+    parsed.subjects.length === 0 ||
+    !parsed.subjects.every(
+      (subject) =>
+        typeof subject === "string" &&
+        subject.trim().length > 0 &&
+        subject.trim().length <= 120,
+    )
+  ) {
+    throw new Error(
+      "The AI did not extract valid subject names from the syllabus.",
+    );
+  }
+
+  allowedSubjects = [
+    ...new Set(
+      parsed.subjects.map((subject) =>
+        (subject as string).trim(),
+      ),
+    ),
+  ];
+} else {
+  allowedSubjects = userSubjects;
+}
+
 
       if (!Array.isArray(parsed.sessions) || parsed.sessions.length === 0) {
         throw new Error("The AI returned an empty study plan.");
@@ -353,7 +388,10 @@ router.post(
         });
         return;
       }
-
+const syllabusForExtraction =
+  syllabusText.length > 12000
+    ? `${syllabusText.slice(0, 9000)}\n\n${syllabusText.slice(-3000)}`
+    : syllabusText;
       const prompt = `
 You are BrainScribe's academic document analysis assistant.
 
@@ -364,7 +402,7 @@ File name: ${fileName.trim().slice(0, 255)}
 
 DOCUMENT CONTENT:
 <syllabus>
-${syllabusText}
+${syllabusForExtraction}
 </syllabus>
 
 RULES:
@@ -393,8 +431,7 @@ If no reliable subject name can be identified, return:
   "subjects": []
 }
 `;
-
-      const rawResponse = await generateAIResponse(prompt);
+const rawResponse = await generateSubjectExtractionResponse(prompt);
       const parsed = extractJson(rawResponse) as {
         subjects?: unknown;
       };
@@ -448,6 +485,7 @@ If no reliable subject name can be identified, return:
       });
     }
   },
+  
 );
 
 router.post(

@@ -442,11 +442,18 @@ export default function AnalyticsPage() {
 
   const formatHours = (minutes: number) => formatDuration(minutes);
 
-  const goalTargetMinutes = 0;
-  const goalProgress = goalTargetMinutes
-    ? Math.min(100, Math.round((weeklyMinutes / goalTargetMinutes) * 100))
+
+const goalTargetMinutes = 10 * 60; // Default weekly goal: 10 hours
+
+const goalProgress =
+  goalTargetMinutes > 0
+    ? Math.min(
+        100,
+        Math.round((weeklyMinutes / goalTargetMinutes) * 100),
+      )
     : 0;
-  const goalRingLength = 2 * Math.PI * 72;
+
+const goalRingLength = 2 * Math.PI * 72;
 
   return (
     <div className="dashboard-shell analytics-shell">

@@ -1,10 +1,12 @@
 import { initializeApp } from "firebase-admin/app";
-import { getFirestore } from "firebase-admin/firestore";
+import { FieldValue,getFirestore } from "firebase-admin/firestore";
 import { defineSecret } from "firebase-functions/params";
 import { HttpsError, onCall } from "firebase-functions/v2/https";
 import { logger } from "firebase-functions";
 import { GoogleGenAI } from "@google/genai";
 import Groq from "groq-sdk";
+import { onSchedule } from "firebase-functions/v2/scheduler";
+import { onDocumentUpdated } from "firebase-functions/v2/firestore";
 
 initializeApp();
 
@@ -849,3 +851,489 @@ export const extractSubjectsFromSyllabus = onCall(
     }
   },
 );
+
+type ReminderPreferences = {
+  enabled: boolean;
+  browserEnabled: boolean;
+  reminderMinutesBefore: 5 | 10 | 15 | 30;
+  missedSessionNotifications: boolean;
+  timezone: string;
+};
+
+type ReminderSession = {
+  id: string;
+  title?: string;
+  subject?: string;
+  date?: string;
+  startTime?: string;
+  duration?: number;
+  completed?: boolean;
+};
+
+const DEFAULT_REMINDER_PREFERENCES: ReminderPreferences = {
+  enabled: true,
+  browserEnabled: false,
+  reminderMinutesBefore: 10,
+  missedSessionNotifications: true,
+  timezone: "Asia/Kolkata",
+};
+
+function getSafeTimezone(value: unknown): string {
+  if (typeof value !== "string" || !value.trim()) {
+    return "Asia/Kolkata";
+  }
+
+  try {
+    new Intl.DateTimeFormat("en-US", {
+      timeZone: value,
+    }).format();
+
+    return value;
+  } catch {
+    return "Asia/Kolkata";
+  }
+}
+
+function getLocalDateKey(date: Date, timezone: string): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+
+  const values = Object.fromEntries(
+    parts.map((part) => [part.type, part.value]),
+  );
+
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+/**
+ * Convert a user's local date and time into a UTC timestamp.
+ * This avoids treating a session's local date/time as server-local time.
+ */
+function localDateTimeToUtc(
+  dateKey: string,
+  timeKey: string,
+  timezone: string,
+): Date | null {
+  if (
+    !isValidDateKey(dateKey) ||
+    !/^([01]\d|2[0-3]):[0-5]\d$/.test(timeKey)
+  ) {
+    return null;
+  }
+
+  const [year, month, day] = dateKey.split("-").map(Number);
+  const [hour, minute] = timeKey.split(":").map(Number);
+
+  const targetAsUtc = Date.UTC(
+    year,
+    month - 1,
+    day,
+    hour,
+    minute,
+    0,
+    0,
+  );
+
+  let guess = targetAsUtc;
+
+  try {
+    const formatter = new Intl.DateTimeFormat("en-GB", {
+      timeZone: timezone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hourCycle: "h23",
+    });
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const parts = formatter.formatToParts(new Date(guess));
+      const values = Object.fromEntries(
+        parts.map((part) => [part.type, part.value]),
+      );
+
+      const representedAsUtc = Date.UTC(
+        Number(values.year),
+        Number(values.month) - 1,
+        Number(values.day),
+        Number(values.hour),
+        Number(values.minute),
+        Number(values.second),
+      );
+
+      const difference = targetAsUtc - representedAsUtc;
+
+      if (difference === 0) {
+        return new Date(guess);
+      }
+
+      guess += difference;
+    }
+
+    const result = new Date(guess);
+    const verified = formatter.formatToParts(result);
+    const values = Object.fromEntries(
+      verified.map((part) => [part.type, part.value]),
+    );
+
+    if (
+      Number(values.year) !== year ||
+      Number(values.month) !== month ||
+      Number(values.day) !== day ||
+      Number(values.hour) !== hour ||
+      Number(values.minute) !== minute
+    ) {
+      return null;
+    }
+
+    return result;
+  } catch {
+    return null;
+  }
+}
+
+async function loadReminderPreferences(
+  uid: string,
+): Promise<ReminderPreferences> {
+  const snapshot = await db
+    .collection("users")
+    .doc(uid)
+    .collection("settings")
+    .doc("notifications")
+    .get();
+
+  const data = snapshot.data() ?? {};
+
+  const allowedLeadTimes = [5, 10, 15, 30] as const;
+
+  const leadTime = allowedLeadTimes.includes(
+    data.reminderMinutesBefore,
+  )
+    ? data.reminderMinutesBefore
+    : DEFAULT_REMINDER_PREFERENCES.reminderMinutesBefore;
+
+  return {
+    enabled:
+      typeof data.enabled === "boolean"
+        ? data.enabled
+        : DEFAULT_REMINDER_PREFERENCES.enabled,
+    browserEnabled:
+      typeof data.browserEnabled === "boolean"
+        ? data.browserEnabled
+        : DEFAULT_REMINDER_PREFERENCES.browserEnabled,
+    reminderMinutesBefore: leadTime,
+    missedSessionNotifications:
+      typeof data.missedSessionNotifications === "boolean"
+        ? data.missedSessionNotifications
+        : DEFAULT_REMINDER_PREFERENCES.missedSessionNotifications,
+    timezone: getSafeTimezone(data.timezone),
+  };
+}
+
+async function createNotificationOnce(
+  uid: string,
+  notificationId: string,
+  notification: {
+    type: "upcoming" | "missed" | "rescheduled";
+    title: string;
+    message: string;
+    sessionId: string;
+    scheduledFor: string | null;
+  },
+): Promise<boolean> {
+  const notificationRef = db
+    .collection("users")
+    .doc(uid)
+    .collection("notifications")
+    .doc(notificationId);
+
+  return db.runTransaction(async (transaction) => {
+    const existing = await transaction.get(notificationRef);
+
+    if (existing.exists) {
+      return false;
+    }
+
+    transaction.create(notificationRef, {
+      ...notification,
+      read: false,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+
+    return true;
+  });
+}
+
+function buildSessionStart(
+  session: ReminderSession,
+  timezone: string,
+): Date | null {
+  if (
+    typeof session.date !== "string" ||
+    typeof session.startTime !== "string"
+  ) {
+    return null;
+  }
+
+  return localDateTimeToUtc(
+    session.date,
+    session.startTime,
+    timezone,
+  );
+}
+
+function safeNotificationPart(value: string): string {
+  return encodeURIComponent(value).replace(/\./g, "%2E");
+}
+
+export const processStudyReminders = onSchedule(
+  {
+    schedule: "every 1 minutes",
+    timeZone: "Etc/UTC",
+    timeoutSeconds: 120,
+    memory: "512MiB",
+    maxInstances: 1,
+  },
+  async () => {
+    const now = new Date();
+    const windowStart = now.getTime() - 5 * 60_000;
+
+    const usersSnapshot = await db.collection("users").get();
+
+    let created = 0;
+    let failed = 0;
+
+    for (const userDoc of usersSnapshot.docs) {
+      const uid = userDoc.id;
+
+      try {
+        const preferences = await loadReminderPreferences(uid);
+
+        if (!preferences.enabled) {
+          continue;
+        }
+
+        const localToday = getLocalDateKey(
+          now,
+          preferences.timezone,
+        );
+
+        const yesterday = addDays(localToday, -1);
+
+        const sessionsSnapshot = await userDoc.ref
+          .collection("studySessions")
+          .where("date", ">=", yesterday)
+          .limit(500)
+          .get();
+
+        for (const sessionDoc of sessionsSnapshot.docs) {
+          const session = {
+            ...sessionDoc.data(),
+            id: sessionDoc.id,
+          } as ReminderSession;
+
+          if (
+            session.completed === true ||
+            typeof session.date !== "string" ||
+            typeof session.startTime !== "string"
+          ) {
+            continue;
+          }
+
+          const start = buildSessionStart(
+            session,
+            preferences.timezone,
+          );
+
+          if (!start) {
+            continue;
+          }
+
+          const startMs = start.getTime();
+          const reminderMs =
+            startMs -
+            preferences.reminderMinutesBefore * 60_000;
+
+          const sessionKey = [
+            safeNotificationPart(session.id),
+            session.date,
+            session.startTime.replace(":", "-"),
+          ].join("_");
+
+          // Upcoming reminders are generated once per session schedule
+          // and selected lead time.
+          if (
+            reminderMs <= now.getTime() &&
+            reminderMs > windowStart
+          ) {
+            try {
+              const wasCreated = await createNotificationOnce(
+                uid,
+                `upcoming_${sessionKey}_${preferences.reminderMinutesBefore}`,
+                {
+                  type: "upcoming",
+                  title: "Study session coming up",
+                  message: `${session.title || session.subject || "Your study session"} starts in ${preferences.reminderMinutesBefore} minutes.`,
+                  sessionId: session.id,
+                  scheduledFor: start.toISOString(),
+                },
+              );
+
+              if (wasCreated) created += 1;
+            } catch (error) {
+              failed += 1;
+              logger.error("Could not create upcoming reminder.", {
+                uid,
+                sessionId: session.id,
+                reason:
+                  error instanceof Error
+                    ? error.message
+                    : "Unknown error",
+              });
+            }
+          }
+
+          const duration =
+            typeof session.duration === "number" &&
+            Number.isFinite(session.duration) &&
+            session.duration > 0
+              ? session.duration
+              : 0;
+
+          const endMs = startMs + duration * 60_000;
+
+          if (
+            preferences.missedSessionNotifications &&
+            endMs <= now.getTime() &&
+            endMs > windowStart
+          ) {
+            try {
+              const wasCreated = await createNotificationOnce(
+                uid,
+                `missed_${sessionKey}`,
+                {
+                  type: "missed",
+                  title: "Study session missed",
+                  message: `${session.title || session.subject || "Your study session"} has passed without being marked complete.`,
+                  sessionId: session.id,
+                  scheduledFor: start.toISOString(),
+                },
+              );
+
+              if (wasCreated) created += 1;
+            } catch (error) {
+              failed += 1;
+              logger.error("Could not create missed-session reminder.", {
+                uid,
+                sessionId: session.id,
+                reason:
+                  error instanceof Error
+                    ? error.message
+                    : "Unknown error",
+              });
+            }
+          }
+        }
+      } catch (error) {
+        failed += 1;
+        logger.error("Could not process study reminders for user.", {
+          uid,
+          reason:
+            error instanceof Error ? error.message : "Unknown error",
+        });
+      }
+    }
+
+    logger.info("Study reminder processing finished.", {
+      created,
+      failed,
+      userCount: usersSnapshot.size,
+    });
+  },
+);
+
+export const notifyWhenStudySessionRescheduled = onDocumentUpdated(
+  "users/{uid}/studySessions/{sessionId}",
+  async (event) => {
+    const before = event.data?.before.data();
+    const after = event.data?.after.data();
+
+    if (!before || !after) {
+      return;
+    }
+
+    if (
+      before.date === after.date &&
+      before.startTime === after.startTime
+    ) {
+      return;
+    }
+
+    if (
+      after.completed === true ||
+      typeof after.date !== "string" ||
+      typeof after.startTime !== "string"
+    ) {
+      return;
+    }
+
+    const { uid, sessionId } = event.params;
+
+    try {
+      const preferences = await loadReminderPreferences(uid);
+
+      if (!preferences.enabled) {
+        return;
+      }
+
+      const newStart = localDateTimeToUtc(
+        after.date,
+        after.startTime,
+        preferences.timezone,
+      );
+
+      if (!newStart) {
+        logger.warn("Invalid rescheduled study session time.", {
+          uid,
+          sessionId,
+        });
+        return;
+      }
+
+      const oldSchedule = `${before.date ?? "unknown"}_${before.startTime ?? "unknown"}`;
+      const newSchedule = `${after.date}_${after.startTime}`;
+
+      const notificationId =
+        `rescheduled_${safeNotificationPart(sessionId)}_` +
+        `${safeNotificationPart(oldSchedule)}_` +
+        `${safeNotificationPart(newSchedule)}`;
+
+      await createNotificationOnce(uid, notificationId, {
+        type: "rescheduled",
+        title: "Study session rescheduled",
+        message: `${after.title || after.subject || "Your study session"} has been moved to ${after.date} at ${after.startTime}.`,
+        sessionId,
+        scheduledFor: newStart.toISOString(),
+      });
+
+      logger.info("Rescheduled study-session notification processed.", {
+        uid,
+        sessionId,
+      });
+    } catch (error) {
+      logger.error("Could not create rescheduled-session notification.", {
+        uid,
+        sessionId,
+        reason:
+          error instanceof Error ? error.message : "Unknown error",
+      });
+    }
+  },
+);
+

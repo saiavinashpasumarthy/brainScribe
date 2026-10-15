@@ -191,7 +191,8 @@ const [selectedSubject, setSelectedSubject] = useState("");
     return unsubscribe;
   }, [user?.uid]);
 
-  // Load subjects from the signed-in user's study schedule.
+
+  // Load subjects from the signed-in user's Subjects page.
   useEffect(() => {
     if (!user?.uid) {
       setSubjectOptions([]);
@@ -199,19 +200,20 @@ const [selectedSubject, setSelectedSubject] = useState("");
       return;
     }
 
+    const subjectsRef = collection(db, "users", user.uid, "subjects");
+
     const unsubscribe = onSnapshot(
-      collection(db, "users", user.uid, "studySessions"),
+      subjectsRef,
       (snapshot) => {
         const subjects = Array.from(
           new Set(
             snapshot.docs
-              .map((document) => document.data().subject)
+              .map((document) => document.data().name)
               .filter(
-                (subject): subject is string =>
-                  typeof subject === "string" &&
-                  subject.trim().length > 0,
+                (name): name is string =>
+                  typeof name === "string" && name.trim().length > 0,
               )
-              .map((subject) => subject.trim()),
+              .map((name) => name.trim()),
           ),
         ).sort((a, b) => a.localeCompare(b));
 
@@ -222,7 +224,7 @@ const [selectedSubject, setSelectedSubject] = useState("");
         );
       },
       (error) => {
-        console.error("Failed to load study subjects:", error);
+        console.error("Failed to load subjects:", error);
         setSubjectOptions([]);
         setSelectedSubject("");
       },

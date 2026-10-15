@@ -30,12 +30,21 @@ import {
   X,
   Pencil,
   Trash2,
+  Bell,
+  Check,
+  CheckCheck,
 } from "lucide-react";
 
 import { useAuth } from "../contexts/AuthContext";
 import { logoutUser } from "../services/authService";
 import { useTheme } from "../contexts/ThemeContext";
 import { db } from "../config/firebase";
+import {
+  subscribeToNotifications,
+  markNotificationAsRead,
+  markAllNotificationsAsRead,
+  type StudyNotification,
+} from "../services/notificationService";
 
 type FocusSession = {
   id: string;
@@ -183,6 +192,16 @@ export default function DashboardPage() {
 
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
+const [notifications, setNotifications] = useState<StudyNotification[]>([]);
+const [notificationsError, setNotificationsError] = useState("");
+const [notificationActionLoading, setNotificationActionLoading] =
+  useState(false);
+
+const unreadCount = useMemo(
+  () => notifications.filter((notification) => !notification.read).length,
+  [notifications],
+);
 
   const [focusSessions, setFocusSessions] = useState<FocusSession[]>([]);
   const [studySessions, setStudySessions] = useState<StudySession[]>([]);
@@ -400,7 +419,29 @@ export default function DashboardPage() {
       unsubscribers.forEach((unsubscribe) => unsubscribe());
     };
   }, [user?.uid]);
+useEffect(() => {
+  if (!user?.uid) {
+    setNotifications([]);
+    setNotificationsError("");
+    return;
+  }
 
+  setNotificationsError("");
+
+  const unsubscribe = subscribeToNotifications(
+    user.uid,
+    (records) => {
+      setNotifications(records);
+      setNotificationsError("");
+    },
+    (error) => {
+      console.error("Failed to load notifications:", error);
+      setNotificationsError("Couldn't load notifications. Please try again.");
+    },
+  );
+
+  return () => unsubscribe();
+}, [user?.uid]);
   const weekData = useMemo(() => {
     const monday = getMonday(new Date());
 
@@ -611,7 +652,35 @@ export default function DashboardPage() {
       setExamDeleting(false);
     }
   }
+async function handleMarkNotificationRead(notificationId: string) {
+  if (!user?.uid) return;
 
+  try {
+    await markNotificationAsRead(user.uid, notificationId);
+  } catch (error) {
+    console.error("Failed to mark notification as read:", error);
+    setNotificationsError("Couldn't update this notification.");
+  }
+}
+
+async function handleMarkAllNotificationsRead() {
+  if (!user?.uid || unreadCount === 0 || notificationActionLoading) return;
+
+  setNotificationActionLoading(true);
+  setNotificationsError("");
+
+  try {
+    await markAllNotificationsAsRead(
+      user.uid,
+      notifications.filter((notification) => !notification.read),
+    );
+  } catch (error) {
+    console.error("Failed to mark all notifications as read:", error);
+    setNotificationsError("Couldn't mark all notifications as read.");
+  } finally {
+    setNotificationActionLoading(false);
+  }
+}
   async function handleLogout() {
     if (loggingOut) return;
 
@@ -756,30 +825,179 @@ export default function DashboardPage() {
               <h2>Your dashboard</h2>
             </div>
           </div>
+<div className="topbar-actions">
+  <span className="topbar-date">
+    {new Date().toLocaleDateString("en-IN", {
+      weekday: "short",
+      day: "numeric",
+      month: "short",
+    })}
+  </span>
 
-          <div className="topbar-actions">
-            <span className="topbar-date">
-              {new Date().toLocaleDateString("en-IN", {
-                weekday: "short",
-                day: "numeric",
-                month: "short",
-              })}
-            </span>
+  <div className="notification-wrapper">
+    <button
+      type="button"
+      className="notification-bell-button"
+      aria-label={`Notifications${unreadCount ? `, ${unreadCount} unread` : ""}`}
+      aria-expanded={notificationsOpen}
+      aria-controls="notification-panel"
+      title="Notifications"
+      onClick={() => setNotificationsOpen((open) => !open)}
+    >
+      <Bell size={19} />
+
+      {unreadCount > 0 && (
+        <span className="notification-unread-badge">
+          {unreadCount > 99 ? "99+" : unreadCount}
+        </span>
+      )}
+    </button>
+
+    {notificationsOpen && (
+      <>
+        <button
+          type="button"
+          className="notification-dismiss-layer"
+          aria-label="Close notifications"
+          onClick={() => setNotificationsOpen(false)}
+        />
+
+        <section
+          id="notification-panel"
+          className="notification-panel"
+          aria-label="Notifications"
+        >
+          <header className="notification-panel-header">
+            <div>
+              <span className="card-eyebrow">YOUR UPDATES</span>
+              <h3>Notifications</h3>
+              <p>
+                {unreadCount > 0
+                  ? `${unreadCount} unread notification${unreadCount === 1 ? "" : "s"}`
+                  : "You're all caught up."}
+              </p>
+            </div>
 
             <button
               type="button"
-              className="dashboard-theme-toggle"
-              onClick={toggleTheme}
-              aria-label={`Switch to ${
-                theme === "dark" ? "light" : "dark"
-              } mode`}
-              title={`Switch to ${
-                theme === "dark" ? "light" : "dark"
-              } mode`}
+              className="notification-close-button"
+              aria-label="Close notifications"
+              onClick={() => setNotificationsOpen(false)}
             >
-              {theme === "dark" ? <Sun size={19} /> : <Moon size={19} />}
+              <X size={17} />
             </button>
+          </header>
+
+          {unreadCount > 0 && (
+            <button
+              type="button"
+              className="notification-mark-all"
+              disabled={notificationActionLoading}
+              onClick={() => void handleMarkAllNotificationsRead()}
+            >
+              <CheckCheck size={15} />
+              {notificationActionLoading
+                ? "Updating..."
+                : "Mark all as read"}
+            </button>
+          )}
+
+          {notificationsError && (
+            <p className="notification-error" role="alert">
+              {notificationsError}
+            </p>
+          )}
+
+          <div className="notification-list">
+            {notifications.length > 0 ? (
+              notifications.map((notification) => (
+                <article
+                  key={notification.id}
+                  className={`notification-item ${
+                    notification.read ? "notification-read" : "notification-unread"
+                  }`}
+                >
+                  <span
+                    className={`notification-type-icon notification-type-${notification.type}`}
+                  >
+                    {notification.type === "upcoming" ? (
+                      <Clock3 size={17} />
+                    ) : notification.type === "missed" ? (
+                      <CalendarDays size={17} />
+                    ) : (
+                      <CalendarDays size={17} />
+                    )}
+                  </span>
+
+                  <div className="notification-item-content">
+                    <strong>{notification.title}</strong>
+                    <p>{notification.message}</p>
+
+                    {notification.scheduledFor && (
+                      <span className="notification-scheduled-time">
+                        Scheduled for{" "}
+                        {new Date(notification.scheduledFor).toLocaleString(
+                          "en-IN",
+                          {
+                            day: "numeric",
+                            month: "short",
+                            hour: "numeric",
+                            minute: "2-digit",
+                          },
+                        )}
+                      </span>
+                    )}
+
+                    {!notification.read && (
+                      <button
+                        type="button"
+                        className="notification-read-action"
+                        onClick={() =>
+                          void handleMarkNotificationRead(notification.id)
+                        }
+                      >
+                        <Check size={14} />
+                        Mark as read
+                      </button>
+                    )}
+                  </div>
+
+                  {!notification.read && (
+                    <span
+                      className="notification-unread-dot"
+                      aria-label="Unread"
+                    />
+                  )}
+                </article>
+              ))
+            ) : (
+              <div className="notification-empty">
+                <span>
+                  <Bell size={24} />
+                </span>
+                <strong>No notifications yet</strong>
+                <p>
+                  Study reminders and session updates will appear here when
+                  they're generated.
+                </p>
+              </div>
+            )}
           </div>
+        </section>
+      </>
+    )}
+  </div>
+
+  <button
+    type="button"
+    className="dashboard-theme-toggle"
+    onClick={toggleTheme}
+    aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+    title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+  >
+    {theme === "dark" ? <Sun size={19} /> : <Moon size={19} />}
+  </button>
+</div>
         </header>
 
         <div className="dashboard-content">

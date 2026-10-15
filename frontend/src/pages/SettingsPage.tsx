@@ -10,10 +10,20 @@ import {
   Sun,
   Target,
   UserRound,
+  Bell,
+  BellRing,
 } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
 import { useTheme, type Theme } from "../contexts/ThemeContext";
 import { useNavigate } from "react-router-dom";
+import {
+  DEFAULT_NOTIFICATION_PREFERENCES,
+  getNotificationPreferences,
+  saveNotificationPreferences,
+  requestBrowserNotificationPermission,
+  type NotificationPreferences,
+} from "../services/notificationService";
+import StudyPlanHistory from "../components/StudyPlanHistory";
 
 interface StudyPreferences {
   dailyGoalHours: number;
@@ -73,7 +83,116 @@ const navigate = useNavigate();
     }));
     setSaved(false);
   };
+const [notificationPreferences, setNotificationPreferences] =
+  useState<NotificationPreferences>({
+    ...DEFAULT_NOTIFICATION_PREFERENCES,
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Kolkata",
+  });
 
+const [notificationsLoading, setNotificationsLoading] = useState(true);
+const [notificationsSaving, setNotificationsSaving] = useState(false);
+const [notificationsSaved, setNotificationsSaved] = useState(false);
+const [notificationSettingsError, setNotificationSettingsError] = useState("");
+useEffect(() => {
+  let cancelled = false;
+
+  async function loadNotificationSettings() {
+    if (!user?.uid) {
+      setNotificationsLoading(false);
+      return;
+    }
+
+    setNotificationsLoading(true);
+    setNotificationSettingsError("");
+
+    try {
+      const preferences = await getNotificationPreferences(user.uid);
+
+      if (!cancelled) {
+        setNotificationPreferences(preferences);
+      }
+    } catch (error) {
+      console.error("Failed to load notification preferences:", error);
+
+      if (!cancelled) {
+        setNotificationSettingsError(
+          "Couldn't load reminder preferences. Please try again.",
+        );
+      }
+    } finally {
+      if (!cancelled) {
+        setNotificationsLoading(false);
+      }
+    }
+  }
+
+  void loadNotificationSettings();
+
+  return () => {
+    cancelled = true;
+  };
+}, [user?.uid]);
+const updateNotificationPreference = <K extends keyof NotificationPreferences>(
+  key: K,
+  value: NotificationPreferences[K],
+) => {
+  setNotificationPreferences((current) => ({
+    ...current,
+    [key]: value,
+  }));
+
+  setNotificationsSaved(false);
+  setNotificationSettingsError("");
+};
+
+const handleBrowserNotificationsChange = async (enabled: boolean) => {
+  if (!enabled) {
+    updateNotificationPreference("browserEnabled", false);
+    return;
+  }
+
+  setNotificationSettingsError("");
+
+  try {
+    const permission = await requestBrowserNotificationPermission();
+
+    if (permission === "granted") {
+      updateNotificationPreference("browserEnabled", true);
+    } else {
+      updateNotificationPreference("browserEnabled", false);
+      setNotificationSettingsError(
+        permission === "denied"
+          ? "Browser notifications are blocked. Allow them in your browser settings to enable this option."
+          : "Browser notification permission wasn't granted.",
+      );
+    }
+  } catch (error) {
+    console.error("Browser notification permission failed:", error);
+    setNotificationSettingsError(
+      "Couldn't enable browser notifications on this device.",
+    );
+  }
+};
+
+const handleSaveNotificationPreferences = async () => {
+  if (!user?.uid || notificationsSaving) return;
+
+  setNotificationsSaving(true);
+  setNotificationsSaved(false);
+  setNotificationSettingsError("");
+
+  try {
+    await saveNotificationPreferences(user.uid, notificationPreferences);
+    setNotificationsSaved(true);
+  } catch (error) {
+    console.error("Failed to save notification preferences:", error);
+    setNotificationSettingsError(
+      "Couldn't save reminder preferences. Please try again.",
+    );
+  } finally {
+    setNotificationsSaving(false);
+  }
+};
   const chooseTheme = (nextTheme: Theme) => {
     if (theme !== nextTheme) {
       toggleTheme();
@@ -148,6 +267,7 @@ const [imageFailed, setImageFailed] = useState(false);
           <div className="settings-divider" />
 
           <p className="settings-side-label">YOUR WORKSPACE</p>
+          
 
           <a className="settings-side-link active" href="#appearance">
             <Palette size={17} />
@@ -161,6 +281,14 @@ const [imageFailed, setImageFailed] = useState(false);
             <BookOpen size={17} />
             Study preferences
           </a>
+          <a className="settings-side-link" href="#study-reminders">
+  <Bell size={17} />
+  Study reminders
+</a>
+<a className="settings-side-link" href="#study-history">
+  <Clock3 size={17} />
+  Study Plan History
+</a>
 
           <div className="settings-tip">
             <Target size={19} />
@@ -357,6 +485,144 @@ const [imageFailed, setImageFailed] = useState(false);
               analytics and focus timer.
             </p>
           </section>
+          
+<section className="settings-card" id="study-reminders">
+  <div className="settings-section-heading">
+    <div className="settings-section-icon">
+      <BellRing size={20} />
+    </div>
+    <div>
+      <h2>Study reminders</h2>
+      <p>Choose when and how BrainScribe reminds you to study.</p>
+    </div>
+  </div>
+
+  {notificationsLoading ? (
+    <p className="settings-helper">Loading your reminder preferences…</p>
+  ) : (
+    <>
+      <div className="reminder-setting-row">
+        <div className="settings-option-copy">
+          <h3>Study reminders</h3>
+          <p>Enable reminders for your scheduled study sessions.</p>
+        </div>
+        <label className="reminder-switch">
+          <input
+            type="checkbox"
+            checked={notificationPreferences.enabled}
+            onChange={(event) =>
+              updateNotificationPreference("enabled", event.target.checked)
+            }
+          />
+          <span className="reminder-switch-track" />
+          <span className="sr-only">Enable study reminders</span>
+        </label>
+      </div>
+
+      <div className="reminder-setting-row">
+        <div className="settings-option-copy">
+          <h3>Browser notifications</h3>
+          <p>
+            Allow BrainScribe to request desktop notifications from this browser.
+          </p>
+        </div>
+        <label className="reminder-switch">
+          <input
+            type="checkbox"
+            checked={notificationPreferences.browserEnabled}
+            disabled={!notificationPreferences.enabled}
+            onChange={(event) =>
+              void handleBrowserNotificationsChange(event.target.checked)
+            }
+          />
+          <span className="reminder-switch-track" />
+          <span className="sr-only">Enable browser notifications</span>
+        </label>
+      </div>
+
+      <div className="settings-field reminder-timing-field">
+        <label htmlFor="reminder-minutes">Remind me before a session</label>
+        <select
+          id="reminder-minutes"
+          value={notificationPreferences.reminderMinutesBefore}
+          disabled={!notificationPreferences.enabled}
+          onChange={(event) =>
+            updateNotificationPreference(
+              "reminderMinutesBefore",
+              Number(event.target.value) as 5 | 10 | 15 | 30,
+            )
+          }
+        >
+          <option value={5}>5 minutes before</option>
+          <option value={10}>10 minutes before</option>
+          <option value={15}>15 minutes before</option>
+          <option value={30}>30 minutes before</option>
+        </select>
+      </div>
+
+      <div className="reminder-setting-row">
+        <div className="settings-option-copy">
+          <h3>Missed-session alerts</h3>
+          <p>Receive an alert when a scheduled study session is missed.</p>
+        </div>
+        <label className="reminder-switch">
+          <input
+            type="checkbox"
+            checked={notificationPreferences.missedSessionNotifications}
+            disabled={!notificationPreferences.enabled}
+            onChange={(event) =>
+              updateNotificationPreference(
+                "missedSessionNotifications",
+                event.target.checked,
+              )
+            }
+          />
+          <span className="reminder-switch-track" />
+          <span className="sr-only">Enable missed-session alerts</span>
+        </label>
+      </div>
+
+      <div className="settings-field reminder-timing-field">
+        <label htmlFor="reminder-timezone">Time zone</label>
+        <input
+          id="reminder-timezone"
+          value={notificationPreferences.timezone}
+          readOnly
+        />
+        <p className="settings-helper">
+          Detected from your device to keep scheduled reminders aligned with
+          your local time.
+        </p>
+      </div>
+
+      {notificationSettingsError && (
+        <p className="reminder-settings-error" role="alert">
+          {notificationSettingsError}
+        </p>
+      )}
+
+      <div className="settings-actions">
+        <button
+          type="button"
+          className="settings-save-button"
+          disabled={notificationsSaving}
+          onClick={() => void handleSaveNotificationPreferences()}
+        >
+          {notificationsSaved ? <Check size={17} /> : <Clock3 size={17} />}
+          {notificationsSaving
+            ? "Saving…"
+            : notificationsSaved
+              ? "Reminder preferences saved"
+              : "Save reminder preferences"}
+        </button>
+        <section className="settings-card" id="study-history">
+  <StudyPlanHistory />
+</section>
+      </div>
+    </>
+  )}
+</section>
+
         </div>
       </div>
     </main>
